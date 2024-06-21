@@ -7,11 +7,14 @@ const cc = @cImport({
     @cInclude("sys/wait.h");
 });
 
-const mem = std.mem;
-const time = std.time;
-const process = std.process;
-const math = std.math;
 const debug = std.debug;
+const log = std.log;
+const math = std.math;
+const mem = std.mem;
+const process = std.process;
+const time = std.time;
+
+pub const std_options: std.Options = .{ .log_level = .info };
 
 const assert = debug.assert;
 const eql = mem.eql;
@@ -52,7 +55,7 @@ fn sigchld_handler(_: c_int) callconv(.C) void {
 
         var wstatus: c_int = undefined;
         if (cc.waitpid(pid, &wstatus, 0) == -1) {
-            print("[signal] waitpid({}) => {}", .{ pid, errno() });
+            log.err("[signal] waitpid({}) => {}", .{ pid, errno() });
             exit(1);
         }
 
@@ -139,8 +142,7 @@ pub fn main() !void {
         break :args .{ files, cmd_string };
     };
 
-    const notify_flags = std.os.linux.IN.CLOEXEC | std.os.linux.IN.NONBLOCK;
-    // const fd = c.inotify_init1(c.IN_CLOEXEC);
+    const notify_flags = std.os.linux.IN.CLOEXEC;
 
     const fd = std.posix.inotify_init1(notify_flags) catch |err|
         switch (err) {
@@ -158,8 +160,6 @@ pub fn main() !void {
         else => unreachable,
     };
 
-    // assert(fd != -1); // NOTE: remove
-
     var filemap = std.AutoHashMap(
         c_int,
         WatchFile,
@@ -173,7 +173,21 @@ pub fn main() !void {
         const wd = std.posix.inotify_add_watch(fd, filename, mask) catch |err|
             switch (err) {
             error.AccessDenied => @panic("AccessDenined"),
-            else => unreachable,
+            error.FileNotFound => {
+                log.warn(
+                    "'{s}' doesn't exist",
+                    .{filename},
+                );
+                continue;
+            },
+            else => {
+                log.err(
+                    "unexpected error \nskipping {s}",
+                    .{@errorName(err)},
+                );
+
+                continue;
+            },
         };
 
         print("=> {s:>20} ({})", .{ filename, wd });
@@ -182,6 +196,11 @@ pub fn main() !void {
             .filename = filename,
             .mask = mask,
         }) catch unreachable;
+    }
+
+    if (filemap.count() == 0) {
+        print("** no files to watch **", .{});
+        exit(1);
     }
 
     listen(fd, &filemap, cmd_string);
@@ -206,29 +225,21 @@ fn listen(
         (NUM_EVENTS * EVENT_SIZE),
     ) catch unreachable; // FIX: read has variable bytes
 
-    var i: usize = 0;
     while (true) {
-        defer i += 1;
-
-        const size = std.posix.read(
-            fd,
-            buffer,
-        ) catch |err| switch (err) {
-            // error. => panic("fdlsajflsd", .{}),
+        const size = std.posix.read(fd, buffer) catch |err|
+            switch (err) {
             error.WouldBlock => {
-                std.time.sleep(std.time.ns_per_ms * 60);
-                continue;
+                log.err("unexpected non-blocking on file descriptor", .{});
+                exit(1);
             },
-            else => unreachable,
+            else => {
+                log.err(
+                    "unexpected error reading watched event => {s}",
+                    .{@errorName(err)},
+                );
+                exit(1);
+            },
         };
-
-        if (size == -1) {
-            const value = errno();
-            // if (value == c.EINTR) continue;
-            if (value == std.c.EAGAIN) continue;
-
-            .panic("errno({})", .{value});
-        }
 
         const num_events: usize = @as(usize, @intCast(size)) / EVENT_SIZE;
 
@@ -238,7 +249,7 @@ fn listen(
         }
 
         for (0..num_events) |event_idx| {
-            const evt: *std.os.linux.inotify_event = @ptrFromInt(
+            const evt: *const std.os.linux.inotify_event = @ptrFromInt(
                 @intFromPtr(buffer.ptr) + (EVENT_SIZE * event_idx),
             );
 
@@ -252,21 +263,18 @@ fn listen(
 
             if (std.os.linux.IN.DELETE_SELF == evt.mask) {
                 const kv = filemap.fetchRemove(evt.wd) orelse unreachable;
+
                 const watchfile = kv.value;
                 print("=> {s}", .{watchfile.filename});
 
                 const wd = std.posix.inotify_add_watch(
                     fd,
-                    watchfile.filename, // FIX: ptr
+                    watchfile.filename,
                     watchfile.mask,
                 ) catch unreachable;
 
                 filemap.putNoClobber(wd, watchfile) catch unreachable;
                 runCommand(args, gpa);
-            }
-
-            if (std.os.linux.IN.IGNORED == evt.mask) {
-                // print("-> IN_IGNORED", .{});
             }
         }
     }
