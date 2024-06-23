@@ -453,20 +453,19 @@ pub fn runCommand(
         break :blk saved_;
     };
 
-    if (running_pid) |pid_| {
-        const pid: c.pid_t = @intCast(pid_);
+    if (running_pid) |pid| {
+        const pgrp: c.pid_t = @intCast(pid);
         running_pid = null;
 
         { // kill
-            if (c.kill(pid, c.SIGTERM) == -1) {
-                log.debug("kill({}) = {s}", .{ pid, errnoToString(errno()) });
-                panic("kill({}) = {s}", .{ pid, errnoToString(errno()) });
+            if (c.killpg(pgrp, c.SIGTERM) == -1) {
+                panic("killpg({}) = {s}", .{ pgrp, errnoToString(errno()) });
             }
 
             var wstatus: c_int = undefined;
-            if (c.waitpid(pid, &wstatus, 0) == -1) {
+            if (c.waitpid(pgrp, &wstatus, 0) == -1) {
                 panic("waitpid({}) = {s}", .{
-                    pid,
+                    pgrp,
                     errnoToString(errno()),
                 });
             }
@@ -480,9 +479,9 @@ pub fn runCommand(
                 //     panic("[error]unexpectedly killed by signal = {}", .{cc.WTERMSIG(wstatus)});
                 // }
             } else if (c.WIFSTOPPED(wstatus)) {
-                panic("unexpected caught signal; process stopped {}", .{pid});
+                panic("unexpected caught signal; process stopped {}", .{pgrp});
             } else if (c.WIFCONTINUED(wstatus)) {
-                panic("unexpected caught signal; process continued {}", .{pid});
+                panic("unexpected caught signal; process continued {}", .{pgrp});
             }
         }
     }
