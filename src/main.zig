@@ -180,6 +180,10 @@ var tty: std.fs.File = undefined;
 var devnull: std.fs.File = undefined;
 var stdout: std.fs.File = undefined;
 
+const CONFIG = struct {
+    pub var clear: bool = false;
+};
+
 pub fn main() !void {
     { // globals
 
@@ -236,9 +240,14 @@ pub fn main() !void {
 
         var args = std.ArrayList([]const u8).init(gpa);
 
-        while (raw_args.next()) |arg| args.append(arg) catch unreachable;
-
-        const found = for (args.items, 0..) |arg, idx| {
+        while (raw_args.next()) |arg| {
+            if (mem.eql(u8, arg, "--clear")) {
+                CONFIG.clear = true;
+            } else {
+                args.append(arg) catch unreachable;
+            }
+        }
+        const command_start_idx = for (args.items, 0..) |arg, idx| {
             if (eql(u8, arg, "-c")) break idx;
         } else {
             log.err(
@@ -248,13 +257,13 @@ pub fn main() !void {
             exit(1);
         };
 
-        if (found + 1 == args.items.len) {
+        if (command_start_idx + 1 == args.items.len) {
             log.err("Command(-c) argument required", .{});
             exit(1);
         }
 
-        const files = args.items[0..found];
-        const cmd_string = args.items[found + 1 ..];
+        const files = args.items[0..command_start_idx];
+        const cmd_string = args.items[command_start_idx + 1 ..];
 
         if (files.len == 0) {
             log.err("files required", .{});
@@ -491,7 +500,6 @@ pub fn runCommand(
         if (c.sigprocmask(c.SIG_SETMASK, &saved, null) !=
             0)
         {
-            log.err("sigprocmask", .{});
             panic(
                 "sigprocmask() = {s}",
                 .{errnoToString(errno())},
@@ -500,7 +508,6 @@ pub fn runCommand(
     }
 
     const value = fork() catch {
-        log.err("unexpected error executing command", .{});
         panic("unexpected error executing command", .{});
     };
 
@@ -595,7 +602,9 @@ pub fn runCommand(
             };
 
             { // exec
-                clearScreen();
+                if (CONFIG.clear) {
+                    clearScreen();
+                }
                 _ = c.execvp(cmd_name.ptr, @ptrCast(cmd_args.items.ptr));
                 switch (errno()) {
                     c.ENOENT => log.err(
