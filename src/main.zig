@@ -295,7 +295,13 @@ pub fn main() !void {
 
         const wd = std.posix.inotify_add_watch(fd, filename, mask) catch |err|
             switch (err) {
-            error.AccessDenied => @panic("AccessDenined"),
+            error.AccessDenied => {
+                log.err(
+                    "'{s}' Permission denied ",
+                    .{filename},
+                );
+                continue;
+            },
             error.FileNotFound => {
                 log.debug(
                     "'{s}' doesn't exist",
@@ -621,8 +627,6 @@ pub fn startProcess(
 
                 _ = c.sigsuspend(&mask);
                 if (errno() != c.EINTR) unreachable;
-
-                print("got signal", .{});
             }
 
             defaultSignal(c.SIGINT);
