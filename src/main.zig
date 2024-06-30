@@ -1,9 +1,5 @@
 const std = @import("std");
-
 const c = @import("./c.zig");
-
-const errnoToString = @import("./errors.zig").errnoToString;
-const signalToString = @import("./errors.zig").signalToString;
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
@@ -19,8 +15,12 @@ const time = std.time;
 const assert = debug.assert;
 const eql = mem.eql;
 const exit = process.exit;
-const openFileAbsolute = fs.openFileAbsolute;
 const panic = debug.panic;
+const sleep = time.sleep;
+
+const errnoToString = @import("./errors.zig").errnoToString;
+const openFileAbsolute = fs.openFileAbsolute;
+const signalToString = @import("./errors.zig").signalToString;
 
 var GPA = std.heap.GeneralPurposeAllocator(.{
     .enable_memory_limit = true,
@@ -36,8 +36,8 @@ fn fork() error{ForkFailure}!union(enum) {
     parent: c_int,
 } {
     const status = c.fork();
-    if (status == -1) return error.ForkFailure;
 
+    if (status == -1) return error.ForkFailure;
     if (status == 0) {
         return .child;
     } else {
@@ -297,7 +297,7 @@ pub fn main() !void {
             switch (err) {
             error.AccessDenied => @panic("AccessDenined"),
             error.FileNotFound => {
-                log.warn(
+                log.debug(
                     "'{s}' doesn't exist",
                     .{filename},
                 );
@@ -326,7 +326,36 @@ pub fn main() !void {
         exit(1);
     }
 
-    start(fd, &filemap, cmd_string);
+    const thread = try std.Thread.spawn(.{}, rerun_loop, .{cmd_string});
+    defer thread.join();
+
+    listen(fd, &filemap, cmd_string);
+}
+
+var should_restart_lock = std.Thread.Mutex{};
+var should_restart = false;
+
+const DELAY_MS = 150;
+
+fn rerun_loop(args: []const []const u8) void {
+    while (true) {
+        const restart = blk: {
+            should_restart_lock.lock();
+            defer should_restart_lock.unlock();
+
+            const result = should_restart;
+            should_restart = false;
+            break :blk result;
+        };
+
+        if (restart) {
+            log.debug("restart", .{});
+            stopRunningProcess();
+            startProcess(args, gpa) catch panic("unexpected error", .{});
+        }
+
+        sleep(time.ns_per_ms * DELAY_MS);
+    }
 }
 
 const WatchFile = struct {
@@ -334,12 +363,13 @@ const WatchFile = struct {
     mask: u32,
 };
 
-/// thread listener for file changes
-fn start(
+/// listen for file changes
+fn listen(
     fd: c_int,
     filemap: *std.AutoHashMap(c_int, WatchFile),
     args: []const []const u8,
 ) void {
+    _ = args; // autofix
     const NUM_EVENTS = 25;
     const EVENT_SIZE = @sizeOf(std.os.linux.inotify_event);
 
@@ -349,13 +379,12 @@ fn start(
     ) catch unreachable; // FIX: read has variable bytes
 
     while (true) {
-        var should_restart = false;
-
         defer {
+            should_restart_lock.lock();
             if (should_restart) {
-                stopRunningProcess();
-                startProcess(args, gpa);
+                should_restart = true;
             }
+            should_restart_lock.unlock();
         }
 
         const size = std.posix.read(fd, buffer) catch |err|
@@ -531,37 +560,48 @@ fn blockSignal(sig: c_int) c.sigset_t {
 pub fn startProcess(
     args: []const []const u8,
     allocator: std.mem.Allocator,
-) void {
-    const value = fork() catch {
-        panic("unexpected error executing command", .{});
-    };
+) error{UnexpectedError}!void {
+    const restore_mask = blockSignal(c.SIGUSR2);
 
-    const original = blockSignal(c.SIGUSR2);
+    const state = fork() catch return error.UnexpectedError;
 
-    switch (value) {
+    switch (state) {
         .parent => |pid| {
             running_pid = @intCast(pid);
 
-            if (c.setpgid(pid, pid) == -1) {
-                log.err("parent failed to create process group", .{});
-                panic(
-                    "setpgid({},{}) => ",
-                    .{ pid, errno() },
-                );
-            }
-
             { //
-                ignoreSignal(c.SIGTTOU);
-                defer defaultSignal(c.SIGTTOU);
+                if (c.setpgid(pid, pid) == -1) {
+                    log.err("parent failed to create process group", .{});
+                    panic(
+                        "setpgid({},{}) => ",
+                        .{ pid, errno() },
+                    );
+                }
                 setForeground(tty.handle, pid);
             }
 
             if (c.kill(pid, c.SIGUSR2) != 0) {
                 log.debug("kill() = {s}", .{errnoToString(errno())});
-                exit(1);
+                return error.UnexpectedError;
             }
         },
         .child => {
+            { //
+                if (c.setpgid(0, 0) == -1) {
+                    log.debug(
+                        "setpgid({}) = {} {s} ",
+                        .{
+                            c.getpid(),
+                            errno(),
+                            errnoToString(errno()),
+                        },
+                    );
+                    return error.UnexpectedError;
+                }
+
+                setForeground(tty.handle, c.getpid());
+            }
+
             { // wait parent
                 const no_op = (&struct {
                     fn f(
@@ -584,9 +624,7 @@ pub fn startProcess(
                 _ = c.sigsuspend(&mask);
                 if (errno() != c.EINTR) unreachable;
 
-                if (c.sigprocmask(c.SIG_SETMASK, &original, null) != 0) {
-                    panic("sigprocmask = {s}", .{errnoToString(errno())});
-                }
+                print("got signal", .{});
             }
 
             defaultSignal(c.SIGINT);
@@ -595,21 +633,6 @@ pub fn startProcess(
             defaultSignal(c.SIGTTIN);
             defaultSignal(c.SIGTTOU);
             defaultSignal(c.SIGCHLD);
-
-            { //
-                if (c.setpgid(0, 0) == -1) {
-                    panic(
-                        "setpgid({}) = {} {s} ",
-                        .{
-                            c.getpid(),
-                            errno(),
-                            errnoToString(errno()),
-                        },
-                    );
-                }
-
-                setForeground(tty.handle, c.getpid());
-            }
 
             // exec
             const cmd_name, const cmd_args = blk: { // null termination
@@ -666,8 +689,8 @@ pub fn startProcess(
             const e = errno();
 
             switch (e) {
-                c.ENOENT => log.err(
-                    "'{s}' does not exist.",
+                c.ENOENT => log.warn(
+                    "Skip: '{s}' does not exist.",
                     .{cmd_name},
                 ),
                 else => panic(
@@ -677,6 +700,11 @@ pub fn startProcess(
             }
             exit(1);
         },
+    }
+
+    if (c.sigprocmask(c.SIG_SETMASK, &restore_mask, null) != 0) {
+        log.err("sigprocmask = {s}", .{errnoToString(errno())});
+        return error.UnexpectedError;
     }
 }
 
