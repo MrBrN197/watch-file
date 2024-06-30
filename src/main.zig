@@ -329,7 +329,7 @@ pub fn main() !void {
     const thread = try std.Thread.spawn(.{}, rerun_loop, .{cmd_string});
     defer thread.join();
 
-    listen(fd, &filemap, cmd_string);
+    listen(fd, &filemap);
 }
 
 var should_restart_lock = std.Thread.Mutex{};
@@ -367,9 +367,7 @@ const WatchFile = struct {
 fn listen(
     fd: c_int,
     filemap: *std.AutoHashMap(c_int, WatchFile),
-    args: []const []const u8,
 ) void {
-    _ = args; // autofix
     const NUM_EVENTS = 25;
     const EVENT_SIZE = @sizeOf(std.os.linux.inotify_event);
 
