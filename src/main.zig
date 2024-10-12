@@ -341,7 +341,7 @@ pub fn main() !void {
 var should_restart_lock = std.Thread.Mutex{};
 var should_restart = false;
 
-const DELAY_MS = 150;
+const DELAY_MS = 350;
 
 fn rerun_loop(args: []const []const u8) void {
     while (true) {
@@ -425,7 +425,17 @@ fn listen(
                     fd,
                     watchfile.filename,
                     watchfile.mask,
-                ) catch unreachable;
+                ) catch |err| {
+                    switch (err) {
+                        error.FileNotFound => {
+                            log.warn("file deleted: {s}", .{
+                                watchfile.filename,
+                            });
+                            continue;
+                        },
+                        else => unreachable,
+                    }
+                };
 
                 filemap.putNoClobber(wd, watchfile) catch unreachable;
             }

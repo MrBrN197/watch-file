@@ -1,20 +1,28 @@
 const std = @import("std");
 
+comptime { // version check
+    const REQUIRED_VERSION_STR = "0.14.0-dev.109+b6fd34aa4";
+    const builtin = @import("builtin");
+
+    const required_version = std.SemanticVersion.parse(
+        REQUIRED_VERSION_STR,
+    ) catch unreachable;
+
+    if (builtin.zig_version.order(required_version) == .lt) {
+        @compileError(std.fmt.comptimePrint(
+            \\
+            \\ Required zig version >={s}
+            \\ Current zig version: {s}
+        , .{ REQUIRED_VERSION_STR, builtin.zig_version_string }));
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // const lib = b.addStaticLibrary(.{
-    //     .name = "watcher",
-    //     .root_source_file = b.path("src/root.zig"),
-    //     .target = target,
-    //     .optimize = optimize,
-    // });
-
-    // b.installArtifact(lib);
-
     const exe = b.addExecutable(.{
-        .name = "askari",
+        .name = "wfile",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
