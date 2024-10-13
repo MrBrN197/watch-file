@@ -357,7 +357,7 @@ fn rerun_loop(args: []const []const u8) void {
         if (restart) {
             log.debug("restart", .{});
             stopRunningProcess();
-            startProcess(args, gpa) catch panic("unexpected error", .{});
+            startProcess(args) catch panic("unexpected error", .{});
         }
 
         sleep(time.ns_per_ms * DELAY_MS);
@@ -573,7 +573,6 @@ fn blockSignal(sig: c_int) c.sigset_t {
 
 pub fn startProcess(
     args: []const []const u8,
-    allocator: std.mem.Allocator,
 ) error{UnexpectedError}!void {
     const restore_mask = blockSignal(c.SIGUSR2);
 
@@ -648,6 +647,11 @@ pub fn startProcess(
 
             // exec
             const cmd_name, const cmd_args = blk: { // null termination
+                var buffer: [1000]u8 = undefined;
+                var fba = std.heap.FixedBufferAllocator.init(&buffer);
+
+                const allocator = fba.allocator();
+
                 const first_arg = allocator.alloc(
                     u8,
                     args[0].len + 1,
