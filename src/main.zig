@@ -1,7 +1,49 @@
+// TODO: CONFIG.timeout // timeout for cmd
+// TODO: CONFIG.wait    // wait for cmd to finish before rerunnig
+
 const std = @import("std");
 const c = @import("./c.zig");
 
-pub const std_options: std.Options = .{ .log_level = .info };
+pub const std_options: std.Options = .{
+    .logFn = logFn,
+};
+
+const EscapeCodes = struct {
+    pub const dim = "\u{1b}[2m";
+    pub const white = "\u{1b}[37m";
+    pub const red = "\u{1b}[31m";
+    pub const yellow = "\u{1b}[33m";
+    pub const green = "\u{1b}[32m";
+    pub const magenta = "\u{1b}[35m";
+    pub const cyan = "\u{1b}[36m";
+    pub const reset = "\u{1b}[0m";
+};
+
+fn logFn(
+    comptime message_level: std.log.Level,
+    comptime scope: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const level_txt = comptime message_level.asText();
+    const prefix2 = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
+    const stderr = std.io.getStdErr().writer();
+    var bw = std.io.bufferedWriter(stderr);
+    const writer = bw.writer();
+    const color = switch (message_level) {
+        .info => "",
+        .err => EscapeCodes.red,
+        .warn => EscapeCodes.yellow,
+        .debug => EscapeCodes.dim,
+    };
+
+    std.debug.lockStdErr();
+    defer std.debug.unlockStdErr();
+    nosuspend {
+        writer.print(color ++ level_txt ++ prefix2 ++ format ++ "\n" ++ EscapeCodes.reset, args) catch return;
+        bw.flush() catch return;
+    }
+}
 
 const debug = std.debug;
 const fs = std.fs;
@@ -152,13 +194,13 @@ fn sigchld_handler(
         if (c.WIFEXITED(wstatus)) {
             const exit_status = c.WEXITSTATUS(wstatus);
             if (exit_status == 0)
-                print("{s}  Status: {}{s}", .{
+                log.info("{s}  Status: {}{s}", .{
                     "\u{1b}[38;5;2m",
                     exit_status,
                     "\u{1b}[m",
                 })
             else
-                print("{s} ❌Status: {}{s}", .{
+                log.info("{s} ❌Status: {}{s}", .{
                     "\u{1b}[38;5;1m",
                     exit_status,
                     "\u{1b}[m",
@@ -172,14 +214,22 @@ var stdout: fs.File = undefined;
 
 const CONFIG = struct {
     pub var clear: bool = false;
+    pub var recursive: bool = true;
 };
+
+const FileMap = std.AutoHashMap(
+    c_int,
+    WatchFile,
+);
+
+pub var inotify_fd: i32 = undefined;
 
 pub fn main() !void {
     { // globals
 
-        GPA.setRequestedMemoryLimit(
-            5000,
-        );
+        // GPA.setRequestedMemoryLimit(
+        //     50000,
+        // );
 
         tty = openFileAbsolute("/dev/tty", .{}) catch |err| {
             log.err("failed to open /dev/tty", .{});
@@ -221,48 +271,57 @@ pub fn main() !void {
         }
     }
 
-    const files, const cmd_string = args: {
+    parse_config();
+
+    const filelist: []const []const u8, const cmd_string: []const []const u8 = args: {
         var raw_args = process.args();
         assert(raw_args.skip());
 
-        var args = std.ArrayList([]const u8).init(gpa);
+        var arglist = std.ArrayList([]const u8).init(gpa);
 
         while (raw_args.next()) |arg| {
-            if (mem.eql(u8, arg, "--clear")) {
-                CONFIG.clear = true;
-            } else {
-                args.append(arg) catch unreachable;
-            }
-        }
-        const command_start_idx = for (args.items, 0..) |arg, idx| {
-            if (eql(u8, arg, "-c")) break idx;
-        } else {
-            log.err(
-                \\command required
-                \\Usage: watchfile <files...> -c <command...>
-            , .{});
-            exit(1);
-        };
+            if (mem.startsWith(u8, arg, "-c") or mem.startsWith(u8, arg, "--command"))
+                break;
+            if (mem.startsWith(u8, arg, "-"))
+                continue;
 
-        if (command_start_idx + 1 == args.items.len) {
-            log.err("Command(-c) argument required", .{});
-            exit(1);
+            arglist.append(arg) catch unreachable;
         }
 
-        const files = args.items[0..command_start_idx];
-        const cmd_string = args.items[command_start_idx + 1 ..];
+        var cmdlist = std.ArrayList([]const u8).init(gpa);
+        while (raw_args.next()) |arg| {
+            cmdlist.append(arg) catch unreachable;
+        }
 
-        if (files.len == 0) {
+        // const command_start_idx = for (arglist.items, 0..) |arg, idx| {
+        //     std.log.info("{s}", .{arg});
+        //     if (eql(u8, arg, "-c")) break idx;
+        // } else {
+        //     log.err(
+        //         \\command required
+        //         \\Usage: watchfile <files...> -c <command...>
+        //     , .{});
+        //     exit(1);
+        // };
+
+        const cmd_string = cmdlist.items;
+        const filelist = arglist.items;
+
+        log.debug("FileList: {s}\n", .{filelist});
+        log.debug("CmdString: {s}\n", .{cmd_string});
+
+        if (filelist.len == 0 or cmd_string.len == 0) {
             log.err("files required", .{});
-            log.info("Usage: watchfile <files...> -c <command...>", .{});
+            log.info("Usage: wfile <files...> -c <command...>", .{});
             exit(1);
         }
-        break :args .{ files, cmd_string };
+
+        break :args .{ filelist, cmd_string };
     };
 
     const notify_flags = std.os.linux.IN.CLOEXEC;
 
-    const fd = std.posix.inotify_init1(notify_flags) catch |err|
+    inotify_fd = std.posix.inotify_init1(notify_flags) catch |err|
         switch (err) {
         error.ProcessFdQuotaExceeded => panic(
             "error: Process Quota reached --> Too many files to watch",
@@ -283,59 +342,52 @@ pub fn main() !void {
         },
     };
 
-    var filemap = std.AutoHashMap(
-        c_int,
-        WatchFile,
-    ).init(std.heap.page_allocator);
+    var filemap = FileMap.init(std.heap.page_allocator);
 
-    for (files) |filename| {
-        const mask = (std.os.linux.IN.MODIFY |
-            std.os.linux.IN.DELETE_SELF |
-            std.os.linux.IN.MOVE_SELF);
+    for (filelist) |filename| {
+        const stat = std.fs.cwd().statFile(filename) catch unreachable;
+        std.log.debug("Filename: {s}", .{filename});
+        switch (stat.kind) {
+            .directory => {
+                const watch_filename = gpa.dupe(u8, filename) catch unreachable;
+                _ = add_file(&filemap, watch_filename);
 
-        const wd = std.posix.inotify_add_watch(fd, filename, mask) catch |err|
-            switch (err) {
-            error.AccessDenied => {
-                log.err(
-                    "'{s}' Permission denied ",
-                    .{filename},
-                );
-                continue;
+                const directory = std.fs.cwd().openDir(filename, .{ .iterate = true, .no_follow = true }) catch unreachable;
+                if (CONFIG.recursive) {
+                    var walker = directory.walk(gpa) catch unreachable;
+                    defer walker.deinit();
+
+                    while (walker.next() catch unreachable) |entry| {
+                        const dupe = std.fs.path.join(gpa, &.{ filename, entry.path }) catch unreachable;
+                        std.log.debug("dir: {s}", .{dupe});
+
+                        if (entry.kind == .directory) {
+                            _ = add_file(&filemap, dupe);
+                        }
+                    }
+                }
             },
-            error.FileNotFound => {
-                log.debug(
-                    "'{s}' doesn't exist",
-                    .{filename},
-                );
-                continue;
+            .file => {
+                const dupe = gpa.dupe(u8, filename) catch unreachable;
+                _ = add_file(&filemap, dupe);
             },
             else => {
-                log.err(
-                    "unexpected error \nskipping {s}",
-                    .{@errorName(err)},
-                );
-
-                continue;
+                log.warn("skipping file type: {s}", .{@tagName(stat.kind)});
             },
-        };
-
-        print("=> {s:>20} ({})", .{ filename, wd });
-
-        filemap.putNoClobber(wd, WatchFile{
-            .filename = filename,
-            .mask = mask,
-        }) catch unreachable;
+        }
     }
 
+    log.info("Watching {} files", .{filemap.count()});
+
     if (filemap.count() == 0) {
-        log.err("** no files to watch **", .{});
+        log.err("***no files to watch***", .{});
         exit(1);
     }
 
-    const thread = try std.Thread.spawn(.{}, rerun_loop, .{cmd_string});
+    const thread = try std.Thread.spawn(.{}, rerun_cmd, .{cmd_string});
     defer thread.join();
 
-    listen(fd, &filemap);
+    listen(gpa, inotify_fd, &filemap);
 }
 
 var should_restart_lock = std.Thread.Mutex{};
@@ -343,7 +395,8 @@ var should_restart = false;
 
 const DELAY_MS = 350;
 
-fn rerun_loop(args: []const []const u8) void {
+/// continuosly run cmd_string
+fn rerun_cmd(args: []const []const u8) void {
     while (true) {
         const restart = blk: {
             should_restart_lock.lock();
@@ -356,8 +409,8 @@ fn rerun_loop(args: []const []const u8) void {
 
         if (restart) {
             log.debug("restart", .{});
-            stopRunningProcess();
-            startProcess(args) catch panic("unexpected error", .{});
+            stop_running_process();
+            start_process(args) catch panic("unexpected error", .{});
         }
 
         sleep(time.ns_per_ms * DELAY_MS);
@@ -369,17 +422,19 @@ const WatchFile = struct {
     mask: u32,
 };
 
+const num_events_max = 1;
+const event_size = @sizeOf(std.os.linux.inotify_event);
+const event_name_slack = std.fs.max_path_bytes;
+
 /// listen for file changes
 fn listen(
+    allocator: std.mem.Allocator,
     fd: c_int,
     filemap: *std.AutoHashMap(c_int, WatchFile),
 ) void {
-    const NUM_EVENTS = 25;
-    const EVENT_SIZE = @sizeOf(std.os.linux.inotify_event);
-
     const buffer = std.heap.page_allocator.alloc(
         u8,
-        (NUM_EVENTS * EVENT_SIZE),
+        (num_events_max * (event_size + event_name_slack)),
     ) catch unreachable; // FIX: read has variable bytes
 
     while (true) {
@@ -405,44 +460,45 @@ fn listen(
                 exit(1);
             },
         };
+        debug.assert(size < buffer.len);
 
-        assert(@mod(size, EVENT_SIZE) == 0);
+        var read_events_buf: []const u8 = buffer[0..size];
+        read_events_buf = read_events_buf;
 
-        const num_events: usize = @as(usize, @intCast(size)) / EVENT_SIZE;
+        while (read_events_buf.len > 0) {
+            const evt: *const std.os.linux.inotify_event =
+                @ptrFromInt(@intFromPtr(read_events_buf.ptr));
+            defer read_events_buf = read_events_buf[event_size + evt.len ..];
 
-        for (0..num_events) |event_idx| {
-            const evt: *const std.os.linux.inotify_event = @ptrFromInt(
-                @intFromPtr(buffer.ptr) + (EVENT_SIZE * event_idx),
-            );
-            log.debug("event: {}", .{evt});
+            format_event(evt, filemap.*);
 
-            if (std.os.linux.IN.DELETE_SELF == evt.mask) {
-                const kv = filemap.fetchRemove(evt.wd) orelse unreachable;
-
-                const watchfile = kv.value;
-
-                const wd = std.posix.inotify_add_watch(
-                    fd,
-                    watchfile.filename,
-                    watchfile.mask,
-                ) catch |err| {
-                    switch (err) {
-                        error.FileNotFound => {
-                            log.warn("file deleted: {s}", .{
-                                watchfile.filename,
-                            });
-                            continue;
-                        },
-                        else => unreachable,
-                    }
-                };
-
-                filemap.putNoClobber(wd, watchfile) catch unreachable;
+            if (std.os.linux.IN.MODIFY & evt.mask != 0 or
+                std.os.linux.IN.CREATE & evt.mask != 0)
+            {
+                log.info("=> {s}", .{evt.getName().?});
             }
 
-            if (std.os.linux.IN.DELETE_SELF == evt.mask or
-                std.os.linux.IN.MODIFY == evt.mask or
-                std.os.linux.IN.MOVE_SELF == evt.mask)
+            if (std.os.linux.IN.DELETE_SELF & evt.mask != 0) {
+                const kv = filemap.fetchRemove(evt.wd) orelse unreachable;
+                gpa.free(kv.value.filename);
+            }
+
+            if (std.os.linux.IN.CREATE & evt.mask != 0) {
+                const name = evt.getName().?;
+                const dir = filemap.get(evt.wd).?.filename;
+                const filename = std.fs.path.join(allocator, &.{ dir, name }) catch unreachable;
+
+                const is_dir = evt.mask & std.os.linux.IN.ISDIR != 0;
+
+                if (is_dir) {
+                    if (add_file(filemap, filename)) {
+                        log.info(EscapeCodes.green ++ "created {s}" ++ EscapeCodes.reset, .{filename});
+                    }
+                }
+            }
+
+            if (std.os.linux.IN.CREATE & evt.mask != 0 or
+                std.os.linux.IN.MODIFY & evt.mask != 0)
             {
                 should_restart = true;
             }
@@ -464,7 +520,7 @@ pub fn setForeground(
     }
 }
 
-pub fn stopRunningProcess() void {
+pub fn stop_running_process() void {
     const saved = blk: { // block
 
         var blocked = c.sigset_t{};
@@ -571,7 +627,7 @@ fn blockSignal(sig: c_int) c.sigset_t {
     return original;
 }
 
-pub fn startProcess(
+pub fn start_process(
     args: []const []const u8,
 ) error{UnexpectedError}!void {
     const restore_mask = blockSignal(c.SIGUSR2);
@@ -706,7 +762,7 @@ pub fn startProcess(
 
             switch (e) {
                 c.ENOENT => log.warn(
-                    "Skip: '{s}' does not exist.",
+                    "skipping '{s}', file does not exist.",
                     .{cmd_name},
                 ),
                 else => panic(
@@ -733,17 +789,101 @@ fn clearScreen() void {
     };
 }
 
-///
-fn eraseLine() void {
-    io.getStdOut().writeAll("\u{1b}[1K\u{0D}") catch |err|
-        panic("unable to write to standard output {s}", .{@errorName(err)});
+// ///
+// fn eraseLine() void {
+//     io.getStdOut().writeAll("\u{1b}[1K\u{0D}") catch |err|
+//         panic("unable to write to standard output {s}", .{@errorName(err)});
+// }
+
+/// set CONFIG variables
+pub fn parse_config() void {
+    var args = process.args();
+    while (args.next()) |arg| {
+        if (mem.eql(u8, arg, "--clear")) {
+            CONFIG.clear = true;
+        } else if (mem.eql(u8, arg, "-r") or mem.eql(u8, arg, "--recursive")) {
+            CONFIG.recursive = true;
+        }
+    }
 }
 
-///
-fn print(comptime fmt: []const u8, args: anytype) void {
-    std.fmt.format(stdout.writer(), fmt, args) catch |err|
-        panic("stdout {s}", .{@errorName(err)});
+pub fn format_event(event: *const std.os.linux.inotify_event, filemap: FileMap) void {
+    _ = filemap; // autofix
+    if (event.mask == 0) return;
 
-    stdout.writeAll("\n") catch |err|
-        panic("stdout {s}", .{@errorName(err)});
+    log.debug(
+        \\File: {?s} ({})
+    , .{ event.getName(), event.wd });
+
+    const event_struct: std.builtin.Type.Struct = @typeInfo(std.os.linux.IN).@"struct";
+    const mask_declarations = event_struct.decls;
+
+    // var buffer: [32]u8 = undefined;
+    // @memset(&buffer, ' ');
+    // inline for (0..32) |i| {
+    //     if (@shlExact(1, i) & event.mask != 0) {
+    //         buffer[i] = '|';
+    //     }
+    // }
+    // std.log.info("buffer: {s}", .{buffer});
+
+    inline for (mask_declarations) |decl| {
+        const mask_value = @field(std.os.linux.IN, decl.name);
+        if (std.mem.eql(u8, decl.name, "ALL_EVENTS")) {} else {
+            if (mask_value & event.mask != 0) {
+                log.debug(" Mask: {s:>10}: {b:>32}", .{ decl.name, mask_value });
+            }
+        }
+    }
+}
+
+pub fn add_file(filemap: *FileMap, filename: []const u8) bool {
+    const mask = (0 |
+        std.os.linux.IN.IGNORED | // TODO: remove; handled by IN.DELETE_SELF
+        std.os.linux.IN.MODIFY | // file inside watched dir was modified
+        std.os.linux.IN.CREATE | // file/dir created in watched dir
+        std.os.linux.IN.DELETE_SELF | // watched file/dir deleted
+        std.os.linux.IN.DELETE | // file/dir inside watched dir was deleted
+        std.os.linux.IN.MOVE_SELF | // watched file/dir moved
+        std.os.linux.IN.MOVED_FROM | //
+        std.os.linux.IN.MOVED_TO); //
+
+    const wd = std.posix.inotify_add_watch(inotify_fd, filename, mask) catch |err|
+        switch (err) {
+        error.AccessDenied => {
+            log.err(
+                "'{s}' Permission denied ",
+                .{filename},
+            );
+            return false;
+        },
+        error.FileNotFound => {
+            log.warn(
+                "'{s}' does not exist",
+                .{filename},
+            );
+            return false;
+        },
+        else => {
+            log.err(
+                "unexpected error \nskipping {s}",
+                .{@errorName(err)},
+            );
+
+            return false;
+        },
+    };
+
+    const entry = filemap.getOrPut(wd) catch unreachable;
+
+    if (entry.found_existing) return false;
+
+    log.info("=> {s:>20} ({})", .{ filename, wd });
+
+    entry.value_ptr.* = WatchFile{
+        .filename = filename,
+        .mask = mask,
+    };
+
+    return true;
 }
