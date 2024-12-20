@@ -215,6 +215,7 @@ var stdout: fs.File = undefined;
 const CONFIG = struct {
     pub var clear: bool = false;
     pub var recursive: bool = true;
+    pub var include_exts: ?[]const []const u8 = null;
 };
 
 const FileMap = std.AutoHashMap(
@@ -345,7 +346,13 @@ pub fn main() !void {
     var filemap = FileMap.init(std.heap.page_allocator);
 
     for (filelist) |filename| {
-        const stat = std.fs.cwd().statFile(filename) catch unreachable;
+        const stat = std.fs.cwd().statFile(filename) catch |err| switch (err) {
+            else => {
+                log.warn("unable to stat file {s} {s}", .{ filename, @errorName(err) });
+                continue;
+            },
+        };
+
         std.log.debug("Filename: {s}", .{filename});
         switch (stat.kind) {
             .directory => {
@@ -368,8 +375,15 @@ pub fn main() !void {
                 }
             },
             .file => {
-                const dupe = gpa.dupe(u8, filename) catch unreachable;
-                _ = add_file(&filemap, dupe);
+                if (CONFIG.include_exts) |include_exts| {
+                    if (include_extension(include_exts, filename)) {
+                        const dupe = gpa.dupe(u8, filename) catch unreachable;
+                        _ = add_file(&filemap, dupe);
+                    }
+                } else {
+                    const dupe = gpa.dupe(u8, filename) catch unreachable;
+                    _ = add_file(&filemap, dupe);
+                }
             },
             else => {
                 log.warn("skipping file type: {s}", .{@tagName(stat.kind)});
@@ -500,7 +514,10 @@ fn listen(
             if (std.os.linux.IN.CREATE & evt.mask != 0 or
                 std.os.linux.IN.MODIFY & evt.mask != 0)
             {
-                should_restart = true;
+                should_restart = if (CONFIG.include_exts) |exts|
+                    include_extension(exts, evt.getName().?)
+                else
+                    true;
             }
         }
     }
@@ -801,6 +818,14 @@ pub fn parse_config() void {
     while (args.next()) |arg| {
         if (mem.eql(u8, arg, "--clear")) {
             CONFIG.clear = true;
+        } else if (mem.eql(u8, arg, "--exts")) {
+            const include_exts = args.next().?;
+            var exts = std.ArrayList([]const u8).init(gpa);
+            var split = std.mem.splitScalar(u8, include_exts, ',');
+            while (split.next()) |ext| {
+                exts.append(ext) catch unreachable;
+            }
+            CONFIG.include_exts = exts.items;
         } else if (mem.eql(u8, arg, "-r") or mem.eql(u8, arg, "--recursive")) {
             CONFIG.recursive = true;
         }
@@ -886,4 +911,15 @@ pub fn add_file(filemap: *FileMap, filename: []const u8) bool {
     };
 
     return true;
+}
+
+pub fn include_extension(extensions: []const []const u8, file: []const u8) bool {
+    const ext = std.fs.path.extension(file)[1..];
+
+    for (extensions) |e| {
+        log.debug("ext: {s} {s} {s}", .{ e, ext, file });
+        if (std.mem.eql(u8, e, ext)) return true;
+    }
+
+    return false;
 }
