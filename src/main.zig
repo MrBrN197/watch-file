@@ -283,6 +283,12 @@ pub fn main() !void {
         while (raw_args.next()) |arg| {
             if (mem.startsWith(u8, arg, "-c") or mem.startsWith(u8, arg, "--command"))
                 break;
+
+            if (mem.eql(u8, arg, "--exts")) {
+                _ = raw_args.next().?;
+                continue;
+            }
+
             if (mem.startsWith(u8, arg, "-"))
                 continue;
 
@@ -376,7 +382,7 @@ pub fn main() !void {
             },
             .file => {
                 if (CONFIG.include_exts) |include_exts| {
-                    if (include_extension(include_exts, filename)) {
+                    if (is_ext_allowed(include_exts, filename)) {
                         const dupe = gpa.dupe(u8, filename) catch unreachable;
                         _ = add_file(&filemap, dupe);
                     }
@@ -489,7 +495,7 @@ fn listen(
             if (std.os.linux.IN.MODIFY & evt.mask != 0 or
                 std.os.linux.IN.CREATE & evt.mask != 0)
             {
-                log.info("=> {s}", .{evt.getName().?});
+                log.info("=> Modified: {s}", .{evt.getName().?});
             }
 
             if (std.os.linux.IN.DELETE_SELF & evt.mask != 0) {
@@ -515,9 +521,13 @@ fn listen(
                 std.os.linux.IN.MODIFY & evt.mask != 0)
             {
                 should_restart = if (CONFIG.include_exts) |exts|
-                    include_extension(exts, evt.getName().?)
+                    (evt.mask & std.os.linux.IN.ISDIR == 0) and is_ext_allowed(exts, evt.getName().?)
                 else
                     true;
+            }
+
+            if (std.os.linux.IN.MOVE_SELF & evt.mask != 0) {
+                should_restart = true;
             }
         }
     }
@@ -820,6 +830,7 @@ pub fn parse_config() void {
             CONFIG.clear = true;
         } else if (mem.eql(u8, arg, "--exts")) {
             const include_exts = args.next().?;
+            std.log.info("next: {s}", .{include_exts});
             var exts = std.ArrayList([]const u8).init(gpa);
             var split = std.mem.splitScalar(u8, include_exts, ',');
             while (split.next()) |ext| {
@@ -913,11 +924,11 @@ pub fn add_file(filemap: *FileMap, filename: []const u8) bool {
     return true;
 }
 
-pub fn include_extension(extensions: []const []const u8, file: []const u8) bool {
+pub fn is_ext_allowed(extensions: []const []const u8, file: []const u8) bool {
     const ext = std.fs.path.extension(file)[1..];
 
     for (extensions) |e| {
-        log.debug("ext: {s} {s} {s}", .{ e, ext, file });
+        log.info("ext: {s} {s} {s}", .{ e, ext, file });
         if (std.mem.eql(u8, e, ext)) return true;
     }
 
