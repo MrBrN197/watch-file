@@ -15,6 +15,10 @@ comptime { // version check
             \\ Current zig version: {s}
         , .{ REQUIRED_VERSION_STR, builtin.zig_version_string }));
     }
+
+    if (builtin.os.tag != .linux) {
+        @compileError("requires Linux");
+    }
 }
 
 pub fn build(b: *std.Build) void {
@@ -29,8 +33,14 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.linkLibC();
-    exe.use_llvm = false;
-    exe.use_lld = false;
+
+    const use_llvm = if (b.option(bool, "use-llvm", "Use LLVM")) |value|
+        value
+    else
+        optimize != .Debug;
+
+    exe.use_llvm = use_llvm;
+    exe.use_lld = use_llvm;
 
     b.installArtifact(exe);
 

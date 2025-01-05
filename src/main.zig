@@ -25,8 +25,12 @@ fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    const level_txt = comptime message_level.asText();
-    const prefix2 = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
+    const level_txt = switch (message_level) {
+        .info => "",
+        else => comptime message_level.asText() ++ ": ",
+    };
+
+    const prefix2 = if (scope == .default) "" else "(" ++ @tagName(scope) ++ "): ";
     const stderr = std.io.getStdErr().writer();
     var bw = std.io.bufferedWriter(stderr);
     const writer = bw.writer();
@@ -218,9 +222,9 @@ const CONFIG = struct {
     pub var include_exts: ?[]const []const u8 = null;
 };
 
-const FileMap = std.AutoHashMap(
+const FileMap = std.AutoArrayHashMap(
     c_int,
-    WatchFile,
+    WatchDir,
 );
 
 pub var inotify_fd: i32 = undefined;
@@ -228,9 +232,9 @@ pub var inotify_fd: i32 = undefined;
 pub fn main() !void {
     { // globals
 
-        // GPA.setRequestedMemoryLimit(
-        //     50000,
-        // );
+        GPA.setRequestedMemoryLimit(
+            50000,
+        );
 
         tty = openFileAbsolute("/dev/tty", .{}) catch |err| {
             log.err("failed to open /dev/tty", .{});
@@ -362,8 +366,8 @@ pub fn main() !void {
         std.log.debug("Filename: {s}", .{filename});
         switch (stat.kind) {
             .directory => {
-                const watch_filename = gpa.dupe(u8, filename) catch unreachable;
-                _ = add_file(&filemap, watch_filename);
+                std.log.debug("add_dir: {s}", .{filename});
+                _ = add_dir(&filemap, gpa.dupe(u8, filename) catch unreachable);
 
                 const directory = std.fs.cwd().openDir(filename, .{ .iterate = true, .no_follow = true }) catch unreachable;
                 if (CONFIG.recursive) {
@@ -371,25 +375,22 @@ pub fn main() !void {
                     defer walker.deinit();
 
                     while (walker.next() catch unreachable) |entry| {
-                        const dupe = std.fs.path.join(gpa, &.{ filename, entry.path }) catch unreachable;
-                        std.log.debug("dir: {s}", .{dupe});
-
                         if (entry.kind == .directory) {
-                            _ = add_file(&filemap, dupe);
+                            const dupe = std.fs.path.join(gpa, &.{ filename, entry.path }) catch unreachable;
+                            std.log.debug("dir: {s}", .{dupe});
+
+                            if (entry.kind == .directory) {
+                                _ = add_dir(&filemap, dupe);
+                            }
                         }
                     }
                 }
             },
             .file => {
-                if (CONFIG.include_exts) |include_exts| {
-                    if (is_ext_allowed(include_exts, filename)) {
-                        const dupe = gpa.dupe(u8, filename) catch unreachable;
-                        _ = add_file(&filemap, dupe);
-                    }
-                } else {
-                    const dupe = gpa.dupe(u8, filename) catch unreachable;
-                    _ = add_file(&filemap, dupe);
-                }
+                const dirname = std.fs.path.dirname(filename) orelse "./";
+                std.log.debug("add_file: {s} dirname: {s} ", .{ filename, dirname });
+                const basename = gpa.dupe(u8, std.fs.path.basename(filename)) catch unreachable;
+                _ = add_file(&filemap, dirname, basename);
             },
             else => {
                 log.warn("skipping file type: {s}", .{@tagName(stat.kind)});
@@ -397,7 +398,20 @@ pub fn main() !void {
         }
     }
 
-    log.info("Watching {} files", .{filemap.count()});
+    log.info("Watching {} directories", .{filemap.count()});
+    for (filemap.values()) |wd| {
+        if (wd.watched_files.items.len == 0) {
+            log.info("> " ++ green("{s}/*"), .{wd.dirname});
+        } else {
+            log.info("> " ++ green("{s}"), .{wd.dirname});
+            for (wd.watched_files.items) |file| {
+                log.info(green("  ./{s}"), .{file});
+            }
+        }
+    }
+    if (CONFIG.include_exts) |exts| {
+        log.info("Extensions: {s}", .{exts});
+    }
 
     if (filemap.count() == 0) {
         log.err("***no files to watch***", .{});
@@ -437,8 +451,14 @@ fn rerun_cmd(args: []const []const u8) void {
     }
 }
 
-const WatchFile = struct {
-    filename: []const u8,
+const WatchDir = struct {
+    /// directory being watched
+    dirname: []const u8,
+    /// list of files to watch in this directory
+    /// if `watch_files` is empty trigger on file change
+    /// otherwise trigger only when file in this list is modified
+    watched_files: std.ArrayList([]const u8),
+    /// use same notify mask to watch a newly added child directory
     mask: u32,
 };
 
@@ -446,18 +466,37 @@ const num_events_max = 1;
 const event_size = @sizeOf(std.os.linux.inotify_event);
 const event_name_slack = std.fs.max_path_bytes;
 
+pub fn green(comptime str: []const u8) []const u8 {
+    return "\u{1b}[38;5;2m" ++ str ++ "\u{1b}[m";
+}
+
 /// listen for file changes
 fn listen(
     allocator: std.mem.Allocator,
     fd: c_int,
-    filemap: *std.AutoHashMap(c_int, WatchFile),
+    filemap: *FileMap,
 ) void {
-    const buffer = std.heap.page_allocator.alloc(
+    const event_buffer = gpa.alloc(
         u8,
         (num_events_max * (event_size + event_name_slack)),
     ) catch unreachable; // FIX: read has variable bytes
 
+    var log_filename_buffer: [1000]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&log_filename_buffer);
+    var log_filename_arena = std.heap.ArenaAllocator.init(fba.allocator());
+
     while (true) {
+        _ = log_filename_arena.reset(.retain_capacity);
+        var log_filenames = std.ArrayList([]const u8).init(log_filename_arena.allocator());
+
+        defer {
+            log.info("Update:", .{});
+            for (log_filenames.items) |name| {
+                log.info("=> " ++ green("{s:>20}"), .{name});
+            }
+            log_filenames.clearAndFree();
+        }
+
         defer {
             should_restart_lock.lock();
             if (should_restart) {
@@ -466,7 +505,7 @@ fn listen(
             should_restart_lock.unlock();
         }
 
-        const size = std.posix.read(fd, buffer) catch |err|
+        const size = std.posix.read(fd, event_buffer) catch |err|
             switch (err) {
             error.WouldBlock => {
                 log.err("unexpected non-blocking on file descriptor", .{});
@@ -480,57 +519,85 @@ fn listen(
                 exit(1);
             },
         };
-        debug.assert(size < buffer.len);
+        debug.assert(size < event_buffer.len);
 
-        var read_events_buf: []const u8 = buffer[0..size];
+        var read_events_buf: []const u8 = event_buffer[0..size];
         read_events_buf = read_events_buf;
 
         while (read_events_buf.len > 0) {
+            {
+                // FIX: fix editors that create a backup delete, delete the original file the recreated
+                time.sleep(time.ns_per_ms * 50);
+            }
             const evt: *const std.os.linux.inotify_event =
                 @ptrFromInt(@intFromPtr(read_events_buf.ptr));
             defer read_events_buf = read_events_buf[event_size + evt.len ..];
 
             format_event(evt, filemap.*);
 
-            if (std.os.linux.IN.MODIFY & evt.mask != 0 or
-                std.os.linux.IN.CREATE & evt.mask != 0)
-            {
-                log.info("=> Modified: {s}", .{evt.getName().?});
-            }
-
             if (std.os.linux.IN.DELETE_SELF & evt.mask != 0) {
-                const kv = filemap.fetchRemove(evt.wd) orelse unreachable;
-                gpa.free(kv.value.filename);
+                const kv = filemap.fetchSwapRemove(evt.wd) orelse unreachable;
+                log.err("=> Deleted: {s}", .{kv.value.dirname});
+                gpa.free(kv.value.dirname);
             }
 
             if (std.os.linux.IN.CREATE & evt.mask != 0) {
                 const name = evt.getName().?;
-                const dir = filemap.get(evt.wd).?.filename;
+                const dir = filemap.get(evt.wd).?.dirname;
                 const filename = std.fs.path.join(allocator, &.{ dir, name }) catch unreachable;
 
-                const is_dir = evt.mask & std.os.linux.IN.ISDIR != 0;
+                const is_dir = (evt.mask & std.os.linux.IN.ISDIR) != 0;
 
                 if (is_dir) {
-                    if (add_file(filemap, filename)) {
+                    if (add_dir(filemap, filename)) {
                         log.info(EscapeCodes.green ++ "created {s}" ++ EscapeCodes.reset, .{filename});
                     }
                 }
             }
 
-            if (std.os.linux.IN.CREATE & evt.mask != 0 or
-                std.os.linux.IN.MODIFY & evt.mask != 0)
-            {
-                should_restart = if (CONFIG.include_exts) |exts|
-                    (evt.mask & std.os.linux.IN.ISDIR == 0) and is_ext_allowed(exts, evt.getName().?)
-                else
-                    true;
+            if (evt.getName()) |name| {
+                const exists = for (log_filenames.items) |fname| {
+                    if (std.mem.eql(u8, fname, name)) break true;
+                } else false;
+
+                if (!exists) log_filenames.append(name) catch unreachable;
             }
 
-            if (std.os.linux.IN.MOVE_SELF & evt.mask != 0) {
-                should_restart = true;
-            }
+            should_restart = should_restart or should_trigger_restart(filemap, evt);
         }
     }
+}
+
+pub fn should_trigger_restart(filemap: *FileMap, evt: *const std.os.linux.inotify_event) bool {
+    if (std.os.linux.IN.CREATE & evt.mask != 0 or
+        std.os.linux.IN.MODIFY & evt.mask != 0)
+    {
+        const watchdir = filemap.get(evt.wd).?;
+
+        const dir_is_watching_file =
+            watchdir.watched_files.items.len == 0 or
+            blk: for (watchdir.watched_files.items) |item|
+        {
+            const triggered_filename = evt.getName().?;
+            if (std.mem.eql(u8, item, triggered_filename)) {
+                break :blk true;
+            }
+        } else false;
+
+        if (dir_is_watching_file) {
+            return if (CONFIG.include_exts) |exts|
+                (evt.mask & std.os.linux.IN.ISDIR == 0) and
+                    is_ext_allowed(exts, evt.getName().?)
+            else
+                true;
+        }
+    }
+
+    if (std.os.linux.IN.MOVE_SELF & evt.mask != 0) {
+        return true;
+    }
+
+    return false;
 }
 
 var running_pid: ?u32 = null;
@@ -830,7 +897,7 @@ pub fn parse_config() void {
             CONFIG.clear = true;
         } else if (mem.eql(u8, arg, "--exts")) {
             const include_exts = args.next().?;
-            std.log.info("next: {s}", .{include_exts});
+            std.log.debug("next: {s}", .{include_exts});
             var exts = std.ArrayList([]const u8).init(gpa);
             var split = std.mem.splitScalar(u8, include_exts, ',');
             while (split.next()) |ext| {
@@ -873,30 +940,32 @@ pub fn format_event(event: *const std.os.linux.inotify_event, filemap: FileMap) 
     }
 }
 
-pub fn add_file(filemap: *FileMap, filename: []const u8) bool {
-    const mask = (0 |
-        std.os.linux.IN.IGNORED | // TODO: remove; handled by IN.DELETE_SELF
-        std.os.linux.IN.MODIFY | // file inside watched dir was modified
-        std.os.linux.IN.CREATE | // file/dir created in watched dir
-        std.os.linux.IN.DELETE_SELF | // watched file/dir deleted
-        std.os.linux.IN.DELETE | // file/dir inside watched dir was deleted
-        std.os.linux.IN.MOVE_SELF | // watched file/dir moved
-        std.os.linux.IN.MOVED_FROM | //
-        std.os.linux.IN.MOVED_TO); //
+pub fn add_dir(filemap: *FileMap, dirname: []const u8) bool {
+    log.debug("Watching directory => {s:>20}", .{dirname});
 
-    const wd = std.posix.inotify_add_watch(inotify_fd, filename, mask) catch |err|
+    const mask = (0 |
+        std.os.linux.IN.IGNORED | // watch was removed
+        std.os.linux.IN.MODIFY |
+        std.os.linux.IN.CREATE |
+        std.os.linux.IN.DELETE_SELF |
+        std.os.linux.IN.DELETE |
+        std.os.linux.IN.MOVE_SELF |
+        std.os.linux.IN.MOVED_FROM |
+        std.os.linux.IN.MOVED_TO);
+
+    const wd = std.posix.inotify_add_watch(inotify_fd, dirname, mask) catch |err|
         switch (err) {
         error.AccessDenied => {
             log.err(
                 "'{s}' Permission denied ",
-                .{filename},
+                .{dirname},
             );
             return false;
         },
         error.FileNotFound => {
             log.warn(
                 "'{s}' does not exist",
-                .{filename},
+                .{dirname},
             );
             return false;
         },
@@ -911,15 +980,66 @@ pub fn add_file(filemap: *FileMap, filename: []const u8) bool {
     };
 
     const entry = filemap.getOrPut(wd) catch unreachable;
+    if (entry.found_existing) return true;
 
-    if (entry.found_existing) return false;
-
-    log.info("=> {s:>20} ({})", .{ filename, wd });
-
-    entry.value_ptr.* = WatchFile{
-        .filename = filename,
+    entry.value_ptr.* = WatchDir{
+        .dirname = dirname,
+        .watched_files = std.ArrayList([]const u8).init(filemap.allocator),
         .mask = mask,
     };
+
+    return true;
+}
+
+pub fn add_file(filemap: *FileMap, dirname: []const u8, filename: []const u8) bool {
+    log.debug("Watching file => {s:>20}", .{filename});
+    const mask = (0 |
+        std.os.linux.IN.IGNORED | // watch was removed
+        std.os.linux.IN.MODIFY |
+        std.os.linux.IN.CREATE |
+        std.os.linux.IN.DELETE_SELF | //
+        // std.os.linux.IN.DELETE | // file/dir inside watched dir was deleted
+        std.os.linux.IN.MOVE_SELF | // watched file/dir moved
+        std.os.linux.IN.MOVED_FROM | //
+        std.os.linux.IN.MOVED_TO); //
+
+    const wd = std.posix.inotify_add_watch(inotify_fd, dirname, mask) catch |err|
+        switch (err) {
+        error.AccessDenied => {
+            log.err(
+                "'{s}' Permission denied ",
+                .{dirname},
+            );
+            return false;
+        },
+        error.FileNotFound => {
+            log.warn(
+                "'{s}' does not exist",
+                .{dirname},
+            );
+            return false;
+        },
+        else => {
+            log.err(
+                "unexpected error \nskipping {s}",
+                .{@errorName(err)},
+            );
+
+            return false;
+        },
+    };
+
+    const entry = filemap.getOrPut(wd) catch unreachable;
+    if (!entry.found_existing) {
+        entry.value_ptr.* = WatchDir{
+            .dirname = dirname,
+            .watched_files = std.ArrayList([]const u8).init(filemap.allocator),
+            .mask = mask,
+        };
+    }
+
+    const files = &entry.value_ptr.*.watched_files;
+    files.append(filename) catch unreachable;
 
     return true;
 }
@@ -928,7 +1048,7 @@ pub fn is_ext_allowed(extensions: []const []const u8, file: []const u8) bool {
     const ext = std.fs.path.extension(file)[1..];
 
     for (extensions) |e| {
-        log.info("ext: {s} {s} {s}", .{ e, ext, file });
+        log.debug("ext: {s} {s} {s}", .{ e, ext, file });
         if (std.mem.eql(u8, e, ext)) return true;
     }
 
