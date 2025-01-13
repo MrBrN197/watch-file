@@ -2,11 +2,29 @@
 // TODO: CONFIG.wait    // wait for cmd to finish before rerunnig
 
 const std = @import("std");
-const c = @import("./c.zig");
+const debug = std.debug;
+const fs = std.fs;
+const io = std.io;
+const log = std.log;
+const math = std.math;
+const mem = std.mem;
+const process = std.process;
+const time = std.time;
+const assert = debug.assert;
+const eql = mem.eql;
+const exit = process.exit;
+const panic = debug.panic;
+const sleep = time.sleep;
+const openFileAbsolute = fs.openFileAbsolute;
+const event_name_slack = std.fs.max_path_bytes;
+
+const c = @import("c.zig");
 
 pub const std_options: std.Options = .{
     .logFn = logFn,
 };
+
+const usage = "Usage: wfile <files> ... -c <command> ...";
 
 const EscapeCodes = struct {
     pub const dim = "\u{1b}[2m";
@@ -49,25 +67,6 @@ fn logFn(
     }
 }
 
-const debug = std.debug;
-const fs = std.fs;
-const io = std.io;
-const log = std.log;
-const math = std.math;
-const mem = std.mem;
-const process = std.process;
-const time = std.time;
-
-const assert = debug.assert;
-const eql = mem.eql;
-const exit = process.exit;
-const panic = debug.panic;
-const sleep = time.sleep;
-
-const errnoToString = @import("./errors.zig").errnoToString;
-const openFileAbsolute = fs.openFileAbsolute;
-const signalToString = @import("./errors.zig").signalToString;
-
 var GPA = std.heap.GeneralPurposeAllocator(.{
     .enable_memory_limit = true,
 }){};
@@ -97,13 +96,13 @@ fn ignoreSignal(
     var signal_set: c.sigset_t = undefined;
     if (c.sigemptyset(&signal_set) == -1) {
         return panic(
-            "sigemptyset() = {s}",
-            .{errnoToString(errno())},
+            "sigemptyset() => errno: {}",
+            .{errno()},
         );
     }
 
     if (c.sigaddset(&signal_set, signal) == -1) {
-        panic("sigaddset() {s}", .{errnoToString(errno())});
+        panic("sigaddset() => errno: {}", .{errno()});
     }
 
     const act = c.struct_sigaction{
@@ -113,7 +112,7 @@ fn ignoreSignal(
     };
 
     if (c.sigaction(signal, &act, null) == -1) {
-        panic("sigaction() {s}", .{errnoToString(errno())});
+        panic("sigaction() => errno: {}", .{errno()});
     }
 }
 
@@ -149,8 +148,8 @@ fn setSignal(
     var signal_set: c.sigset_t = undefined;
     if (c.sigemptyset(&signal_set) == -1) {
         return panic(
-            "failed to set filled signal set = {s}",
-            .{errnoToString(errno())},
+            "failed to set filled signal set => {}",
+            .{errno()},
         );
     }
 
@@ -248,15 +247,15 @@ pub fn main() !void {
         var block_chld = c.sigset_t{};
         if (c.sigemptyset(&block_chld) == -1) {
             panic(
-                "sigemptyset() = {s}",
-                .{errnoToString(errno())},
+                "sigemptyset() = {}",
+                .{errno()},
             );
         }
 
         if (c.sigaddset(&block_chld, c.SIGCHLD) == -1) {
             panic(
-                "sigaddset() = {s}",
-                .{errnoToString(errno())},
+                "sigaddset() = {}",
+                .{errno()},
             );
         }
 
@@ -270,8 +269,8 @@ pub fn main() !void {
 
         if (c.sigaction(c.SIGCHLD, &action, null) != 0) {
             panic(
-                "[error]sigaction() = {s}",
-                .{errnoToString(errno())},
+                "[error]sigaction() = {}",
+                .{errno()},
             );
         }
     }
@@ -282,7 +281,7 @@ pub fn main() !void {
         var raw_args = process.args();
         assert(raw_args.skip());
 
-        var arglist = std.ArrayList([]const u8).init(gpa);
+        var file_args = std.ArrayList([]const u8).init(gpa);
 
         while (raw_args.next()) |arg| {
             if (mem.startsWith(u8, arg, "-c") or mem.startsWith(u8, arg, "--command"))
@@ -296,34 +295,41 @@ pub fn main() !void {
             if (mem.startsWith(u8, arg, "-"))
                 continue;
 
-            arglist.append(arg) catch unreachable;
+            file_args.append(arg) catch unreachable;
         }
+
+        const has_dot_wfile: ?std.fs.File = std.fs.cwd().openFile("./.wfile", .{ .mode = .read_only }) catch null;
+        if (has_dot_wfile) |dot_wfile| {
+            const reader = dot_wfile.reader();
+            defer dot_wfile.close();
+
+            while (reader.readUntilDelimiterOrEofAlloc(gpa, '\n', std.fs.max_path_bytes) catch unreachable) |line| {
+                const filepath = gpa.dupe(u8, line) catch unreachable;
+                file_args.append(filepath) catch unreachable;
+                std.log.info("{s}", .{line});
+            }
+        } else unreachable;
 
         var cmdlist = std.ArrayList([]const u8).init(gpa);
         while (raw_args.next()) |arg| {
             cmdlist.append(arg) catch unreachable;
         }
 
-        // const command_start_idx = for (arglist.items, 0..) |arg, idx| {
-        //     std.log.info("{s}", .{arg});
-        //     if (eql(u8, arg, "-c")) break idx;
-        // } else {
-        //     log.err(
-        //         \\command required
-        //         \\Usage: watchfile <files...> -c <command...>
-        //     , .{});
-        //     exit(1);
-        // };
-
         const cmd_string = cmdlist.items;
-        const filelist = arglist.items;
+        const filelist = file_args.items;
 
         log.debug("FileList: {s}\n", .{filelist});
         log.debug("CmdString: {s}\n", .{cmd_string});
 
-        if (filelist.len == 0 or cmd_string.len == 0) {
+        if (filelist.len == 0) {
             log.err("files required", .{});
-            log.info("Usage: wfile <files...> -c <command...>", .{});
+            log.info("{s}", .{usage});
+            exit(1);
+        }
+
+        if (cmd_string.len == 0) {
+            log.err("cmd string required", .{});
+            log.info("{s}", .{usage});
             exit(1);
         }
 
@@ -444,7 +450,7 @@ fn rerun_cmd(args: []const []const u8) void {
         if (restart) {
             log.debug("restart", .{});
             stop_running_process();
-            start_process(args) catch panic("unexpected error", .{});
+            startProcess(args) catch panic("unexpected error", .{});
         }
 
         sleep(time.ns_per_ms * DELAY_MS);
@@ -464,8 +470,6 @@ const WatchDir = struct {
 
 const num_events_max = 1;
 const event_size = @sizeOf(std.os.linux.inotify_event);
-const event_name_slack = std.fs.max_path_bytes;
-
 pub fn green(comptime str: []const u8) []const u8 {
     return "\u{1b}[38;5;2m" ++ str ++ "\u{1b}[m";
 }
@@ -610,7 +614,7 @@ pub fn setForeground(
     defer defaultSignal(c.SIGTTOU);
 
     if (c.tcsetpgrp(fd, pgrp) == -1) {
-        panic("tcsetpgrp({}) = {s}", .{ fd, errnoToString(errno()) });
+        panic("tcsetpgrp({}) = {}", .{ fd, errno() });
     }
 }
 
@@ -635,8 +639,8 @@ pub fn stop_running_process() void {
         ) != 0) {
             log.err("failed to block signal", .{});
             panic(
-                "sigprocmask() = {s}",
-                .{errnoToString(errno())},
+                "sigprocmask() = {}",
+                .{errno()},
             );
         }
         break :blk saved_;
@@ -650,14 +654,14 @@ pub fn stop_running_process() void {
             log.debug("killpg({})", .{pid});
 
             if (c.killpg(pgrp, c.SIGKILL) == -1) {
-                panic("killpg({}) = {s}", .{ pgrp, errnoToString(errno()) });
+                panic("killpg({}) = {}", .{ pgrp, errno() });
             }
 
             var wstatus: c_int = undefined;
             if (c.waitpid(pgrp, &wstatus, 0) == -1) {
-                panic("waitpid({}) = {s}", .{
+                panic("waitpid({}) = {}", .{
                     pgrp,
-                    errnoToString(errno()),
+                    errno(),
                 });
             }
 
@@ -683,8 +687,8 @@ pub fn stop_running_process() void {
             0)
         {
             panic(
-                "sigprocmask() = {s}",
-                .{errnoToString(errno())},
+                "sigprocmask() = {}",
+                .{errno()},
             );
         }
     }
@@ -696,24 +700,24 @@ fn blockSignal(sig: c_int) c.sigset_t {
 
     if (c.sigemptyset(&mask) != 0) {
         log.debug(
-            "sigemptyset() = {s}",
-            .{errnoToString(errno())},
+            "sigemptyset() = {}",
+            .{errno()},
         );
         exit(1);
     }
 
     if (c.sigaddset(&mask, sig) != 0) {
         log.debug(
-            "sigaddset() = {s}",
-            .{errnoToString(errno())},
+            "sigaddset() = {}",
+            .{errno()},
         );
         exit(1);
     }
 
     if (c.sigprocmask(c.SIG_BLOCK, &mask, &original) != 0) {
         log.debug(
-            "sigprocmask() = {s}",
-            .{errnoToString(errno())},
+            "sigprocmask() = {}",
+            .{errno()},
         );
         exit(1);
     }
@@ -721,7 +725,7 @@ fn blockSignal(sig: c_int) c.sigset_t {
     return original;
 }
 
-pub fn start_process(
+pub fn startProcess(
     args: []const []const u8,
 ) error{UnexpectedError}!void {
     const restore_mask = blockSignal(c.SIGUSR2);
@@ -744,7 +748,7 @@ pub fn start_process(
             }
 
             if (c.kill(pid, c.SIGUSR2) != 0) {
-                log.debug("kill() = {s}", .{errnoToString(errno())});
+                log.debug("kill() = {}", .{errno()});
                 return error.UnexpectedError;
             }
         },
@@ -752,11 +756,10 @@ pub fn start_process(
             { //
                 if (c.setpgid(0, 0) == -1) {
                     log.debug(
-                        "setpgid({}) = {} {s} ",
+                        "setpgid({}) = {}",
                         .{
                             c.getpid(),
                             errno(),
-                            errnoToString(errno()),
                         },
                     );
                     return error.UnexpectedError;
@@ -778,10 +781,10 @@ pub fn start_process(
 
                 var mask = c.sigset_t{};
                 if (c.sigfillset(&mask) != 0) {
-                    panic("sigfillset = {s}", .{errnoToString(errno())});
+                    panic("sigfillset = {}", .{errno()});
                 }
                 if (c.sigdelset(&mask, c.SIGUSR2) != 0) {
-                    panic("sigdelset = {s}", .{errnoToString(errno())});
+                    panic("sigdelset = {}", .{errno()});
                 }
 
                 _ = c.sigsuspend(&mask);
@@ -860,8 +863,8 @@ pub fn start_process(
                     .{cmd_name},
                 ),
                 else => panic(
-                    "failed to run executable = {s}",
-                    .{errnoToString(e)},
+                    "failed to run executable = {}",
+                    .{e},
                 ),
             }
             exit(1);
@@ -869,7 +872,7 @@ pub fn start_process(
     }
 
     if (c.sigprocmask(c.SIG_SETMASK, &restore_mask, null) != 0) {
-        log.err("sigprocmask = {s}", .{errnoToString(errno())});
+        log.err("sigprocmask = {}", .{errno()});
         return error.UnexpectedError;
     }
 }
