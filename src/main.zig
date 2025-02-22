@@ -211,10 +211,11 @@ fn sigChildHandler(
 var tty: fs.File = undefined;
 var stdout: fs.File = undefined;
 
-const CONFIG = struct {
+const config = struct {
     pub var clear: ?u64 = std.time.ns_per_ms * 200;
     pub var recursive: bool = true;
     pub var include_exts: ?[]const []const u8 = null;
+    pub var delay: u64 = std.time.ns_per_ms * 350;
 };
 
 const FileMap = std.AutoArrayHashMap(
@@ -269,7 +270,7 @@ pub fn main() !void {
         }
     }
 
-    parseConfig();
+    createConfigFromArgs();
 
     const filelist: []const []const u8, const cmd_string: []const []const u8 = args: {
         var raw_args = process.args();
@@ -364,7 +365,7 @@ pub fn main() !void {
                 _ = addDir(&filemap, gpa.dupe(u8, filename) catch unreachable);
 
                 const directory = std.fs.cwd().openDir(filename, .{ .iterate = true, .no_follow = true }) catch unreachable;
-                if (CONFIG.recursive) {
+                if (config.recursive) {
                     var walker = directory.walk(gpa) catch unreachable;
                     defer walker.deinit();
 
@@ -409,7 +410,7 @@ pub fn main() !void {
             }
         }
     }
-    if (CONFIG.include_exts) |exts| {
+    if (config.include_exts) |exts| {
         log.info("Extensions: {s}", .{exts});
     }
 
@@ -421,8 +422,6 @@ pub fn main() !void {
 
 var should_restart_lock = std.Thread.Mutex{};
 var should_restart = false;
-
-const DELAY_MS = 350;
 
 /// continuosly run cmd_string
 fn rerunProcess(args: []const []const u8) void {
@@ -442,7 +441,7 @@ fn rerunProcess(args: []const []const u8) void {
             startProcess(args) catch debug.panic("unexpected error", .{});
         }
 
-        time.sleep(time.ns_per_ms * DELAY_MS);
+        time.sleep(config.delay);
     }
 }
 
@@ -581,7 +580,7 @@ pub fn shouldTriggerRestart(filemap: *FileMap, evt: *const std.os.linux.inotify_
         } else false;
 
         if (dir_is_watching_file) {
-            return if (CONFIG.include_exts) |exts|
+            return if (config.include_exts) |exts|
                 (evt.mask & std.os.linux.IN.ISDIR == 0) and
                     isExtAllowed(exts, evt.getName().?)
             else
@@ -842,7 +841,7 @@ pub fn startProcess(
                 break :blk .{ first_arg, c_args };
             };
 
-            if (CONFIG.clear) |delay| {
+            if (config.clear) |delay| {
                 clearScreen();
                 time.sleep(delay);
             }
@@ -886,11 +885,14 @@ fn clearScreen() void {
 // }
 
 /// set CONFIG variables
-pub fn parseConfig() void {
+pub fn createConfigFromArgs() void {
     var args = process.args();
     while (args.next()) |arg| {
-        if (mem.eql(u8, arg, "--no-clear")) {
-            CONFIG.clear = null;
+        if (mem.eql(u8, arg, "--delay")) {
+            const delay_val = args.next() orelse @panic("--delay requires value");
+            config.delay = std.fmt.parseInt(u32, delay_val, 10) catch @panic("invalid argument value");
+        } else if (mem.eql(u8, arg, "--no-clear")) {
+            config.clear = null;
         } else if (mem.eql(u8, arg, "--exts")) {
             const include_exts = args.next().?;
             std.log.debug("next: {s}", .{include_exts});
@@ -899,9 +901,9 @@ pub fn parseConfig() void {
             while (split.next()) |ext| {
                 exts.append(ext) catch unreachable;
             }
-            CONFIG.include_exts = exts.items;
+            config.include_exts = exts.items;
         } else if (mem.eql(u8, arg, "-r") or mem.eql(u8, arg, "--recursive")) {
-            CONFIG.recursive = true;
+            config.recursive = true;
         }
     }
 }
