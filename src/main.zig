@@ -15,7 +15,6 @@ const eql = mem.eql;
 const exit = process.exit;
 const panic = debug.panic;
 const sleep = time.sleep;
-const openFileAbsolute = fs.openFileAbsolute;
 const event_name_slack = std.fs.max_path_bytes;
 
 const c = @import("c.zig");
@@ -26,7 +25,7 @@ pub const std_options: std.Options = .{
 
 const usage = "Usage: wfile <files> ... -c <command> ...";
 
-const EscapeCodes = struct {
+const escape_codes = struct {
     pub const dim = "\u{1b}[2m";
     pub const white = "\u{1b}[37m";
     pub const red = "\u{1b}[31m";
@@ -54,15 +53,15 @@ fn logFn(
     const writer = bw.writer();
     const color = switch (message_level) {
         .info => "",
-        .err => EscapeCodes.red,
-        .warn => EscapeCodes.yellow,
-        .debug => EscapeCodes.dim,
+        .err => escape_codes.red,
+        .warn => escape_codes.yellow,
+        .debug => escape_codes.dim,
     };
 
     std.debug.lockStdErr();
     defer std.debug.unlockStdErr();
     nosuspend {
-        writer.print(color ++ level_txt ++ prefix2 ++ format ++ "\n" ++ EscapeCodes.reset, args) catch return;
+        writer.print(color ++ level_txt ++ prefix2 ++ format ++ "\n" ++ escape_codes.reset, args) catch return;
         bw.flush() catch return;
     }
 }
@@ -164,7 +163,7 @@ fn setSignal(
     }
 }
 
-fn sigchld_handler(
+fn sigChildHandler(
     _: c_int,
     info: [*c]c.siginfo_t,
     _: ?*anyopaque,
@@ -233,7 +232,7 @@ pub fn main() !void {
 
         GPA.requested_memory_limit = 50 * 1024;
 
-        tty = openFileAbsolute("/dev/tty", .{}) catch |err| {
+        tty = fs.openFileAbsolute("/dev/tty", .{}) catch |err| {
             log.err("failed to open /dev/tty", .{});
             panic("open /dev/tty = {s}", .{@errorName(err)});
         };
@@ -259,7 +258,7 @@ pub fn main() !void {
 
         var action = c.struct_sigaction{
             .__sigaction_handler = .{
-                .sa_sigaction = sigchld_handler,
+                .sa_sigaction = sigChildHandler,
             },
             .sa_mask = block_chld,
             .sa_flags = c.SA_SIGINFO,
@@ -273,7 +272,7 @@ pub fn main() !void {
         }
     }
 
-    parse_config();
+    parseConfig();
 
     const filelist: []const []const u8, const cmd_string: []const []const u8 = args: {
         var raw_args = process.args();
@@ -365,7 +364,7 @@ pub fn main() !void {
         switch (stat.kind) {
             .directory => {
                 std.log.debug("add_dir: {s}", .{filename});
-                _ = add_dir(&filemap, gpa.dupe(u8, filename) catch unreachable);
+                _ = addDir(&filemap, gpa.dupe(u8, filename) catch unreachable);
 
                 const directory = std.fs.cwd().openDir(filename, .{ .iterate = true, .no_follow = true }) catch unreachable;
                 if (CONFIG.recursive) {
@@ -378,7 +377,7 @@ pub fn main() !void {
                             std.log.debug("dir: {s}", .{dupe});
 
                             if (entry.kind == .directory) {
-                                _ = add_dir(&filemap, dupe);
+                                _ = addDir(&filemap, dupe);
                             }
                         }
                     }
@@ -388,7 +387,7 @@ pub fn main() !void {
                 const dirname = std.fs.path.dirname(filename) orelse "./";
                 std.log.debug("add_file: {s} dirname: {s} ", .{ filename, dirname });
                 const basename = gpa.dupe(u8, std.fs.path.basename(filename)) catch unreachable;
-                _ = add_file(&filemap, dirname, basename);
+                _ = addFile(&filemap, dirname, basename);
             },
             else => {
                 log.warn("skipping file type: {s}", .{@tagName(stat.kind)});
@@ -417,7 +416,7 @@ pub fn main() !void {
         log.info("Extensions: {s}", .{exts});
     }
 
-    const thread = try std.Thread.spawn(.{}, rerun_cmd, .{cmd_string});
+    const thread = try std.Thread.spawn(.{}, rerunProcess, .{cmd_string});
     defer thread.join();
 
     listen(gpa, inotify_fd, &filemap);
@@ -429,7 +428,7 @@ var should_restart = false;
 const DELAY_MS = 350;
 
 /// continuosly run cmd_string
-fn rerun_cmd(args: []const []const u8) void {
+fn rerunProcess(args: []const []const u8) void {
     while (true) {
         const restart = blk: {
             should_restart_lock.lock();
@@ -442,7 +441,7 @@ fn rerun_cmd(args: []const []const u8) void {
 
         if (restart) {
             log.debug("restart", .{});
-            stop_running_process();
+            stopRunningProcess();
             startProcess(args) catch panic("unexpected error", .{});
         }
 
@@ -530,7 +529,7 @@ fn listen(
                 @ptrFromInt(@intFromPtr(read_events_buf.ptr));
             defer read_events_buf = read_events_buf[event_size + evt.len ..];
 
-            format_event(evt, filemap.*);
+            formatEvent(evt);
 
             if (std.os.linux.IN.DELETE_SELF & evt.mask != 0) {
                 const kv = filemap.fetchSwapRemove(evt.wd) orelse unreachable;
@@ -546,8 +545,8 @@ fn listen(
                 const is_dir = (evt.mask & std.os.linux.IN.ISDIR) != 0;
 
                 if (is_dir) {
-                    if (add_dir(filemap, filename)) {
-                        log.info(EscapeCodes.green ++ "created {s}" ++ EscapeCodes.reset, .{filename});
+                    if (addDir(filemap, filename)) {
+                        log.info(escape_codes.green ++ "created {s}" ++ escape_codes.reset, .{filename});
                     }
                 }
             }
@@ -560,12 +559,12 @@ fn listen(
                 if (!exists) log_filenames.append(name) catch unreachable;
             }
 
-            should_restart = should_restart or should_trigger_restart(filemap, evt);
+            should_restart = should_restart or shouldTriggerRestart(filemap, evt);
         }
     }
 }
 
-pub fn should_trigger_restart(filemap: *FileMap, evt: *const std.os.linux.inotify_event) bool {
+pub fn shouldTriggerRestart(filemap: *FileMap, evt: *const std.os.linux.inotify_event) bool {
     if (std.os.linux.IN.CREATE & evt.mask != 0 or
         std.os.linux.IN.MOVE & evt.mask != 0 or
         std.os.linux.IN.MODIFY & evt.mask != 0)
@@ -587,7 +586,7 @@ pub fn should_trigger_restart(filemap: *FileMap, evt: *const std.os.linux.inotif
         if (dir_is_watching_file) {
             return if (CONFIG.include_exts) |exts|
                 (evt.mask & std.os.linux.IN.ISDIR == 0) and
-                    is_ext_allowed(exts, evt.getName().?)
+                    isExtAllowed(exts, evt.getName().?)
             else
                 true;
         }
@@ -614,7 +613,7 @@ pub fn setForeground(
     }
 }
 
-pub fn stop_running_process() void {
+pub fn stopRunningProcess() void {
     const saved = blk: { // block
 
         var blocked = c.sigset_t{};
@@ -890,7 +889,7 @@ fn clearScreen() void {
 // }
 
 /// set CONFIG variables
-pub fn parse_config() void {
+pub fn parseConfig() void {
     var args = process.args();
     while (args.next()) |arg| {
         if (mem.eql(u8, arg, "--no-clear")) {
@@ -910,8 +909,7 @@ pub fn parse_config() void {
     }
 }
 
-pub fn format_event(event: *const std.os.linux.inotify_event, filemap: FileMap) void {
-    _ = filemap; // autofix
+pub fn formatEvent(event: *const std.os.linux.inotify_event) void {
     if (event.mask == 0) return;
 
     log.debug(
@@ -940,7 +938,7 @@ pub fn format_event(event: *const std.os.linux.inotify_event, filemap: FileMap) 
     }
 }
 
-pub fn add_dir(filemap: *FileMap, dirname: []const u8) bool {
+pub fn addDir(filemap: *FileMap, dirname: []const u8) bool {
     log.debug("Watching directory => {s:>20}", .{dirname});
 
     const mask = (0 |
@@ -991,7 +989,7 @@ pub fn add_dir(filemap: *FileMap, dirname: []const u8) bool {
     return true;
 }
 
-pub fn add_file(filemap: *FileMap, dirname: []const u8, filename: []const u8) bool {
+pub fn addFile(filemap: *FileMap, dirname: []const u8, filename: []const u8) bool {
     log.debug("Watching file => {s:>20}", .{filename});
     const mask = (0 |
         std.os.linux.IN.IGNORED | // watch was removed
@@ -1044,7 +1042,7 @@ pub fn add_file(filemap: *FileMap, dirname: []const u8, filename: []const u8) bo
     return true;
 }
 
-pub fn is_ext_allowed(extensions: []const []const u8, file: []const u8) bool {
+pub fn isExtAllowed(extensions: []const []const u8, file: []const u8) bool {
     const ext = std.fs.path.extension(file)[1..];
 
     for (extensions) |e| {
