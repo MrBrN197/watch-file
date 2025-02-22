@@ -197,7 +197,7 @@ fn sigchld_handler(
         if (c.WIFEXITED(wstatus)) {
             const exit_status = c.WEXITSTATUS(wstatus);
             if (exit_status == 0)
-                log.info("{s}  Status: {}{s}", .{
+                log.info("{s}  Exit Code: {}{s}", .{
                     "\u{1b}[38;5;2m",
                     exit_status,
                     "\u{1b}[m",
@@ -216,7 +216,7 @@ var tty: fs.File = undefined;
 var stdout: fs.File = undefined;
 
 const CONFIG = struct {
-    pub var clear: bool = false;
+    pub var clear: ?u64 = std.time.ns_per_ms * 200;
     pub var recursive: bool = true;
     pub var include_exts: ?[]const []const u8 = null;
 };
@@ -231,9 +231,7 @@ pub var inotify_fd: i32 = undefined;
 pub fn main() !void {
     { // globals
 
-        GPA.setRequestedMemoryLimit(
-            50000,
-        );
+        GPA.requested_memory_limit = 50 * 1024;
 
         tty = openFileAbsolute("/dev/tty", .{}) catch |err| {
             log.err("failed to open /dev/tty", .{});
@@ -306,9 +304,9 @@ pub fn main() !void {
             while (reader.readUntilDelimiterOrEofAlloc(gpa, '\n', std.fs.max_path_bytes) catch unreachable) |line| {
                 const filepath = gpa.dupe(u8, line) catch unreachable;
                 file_args.append(filepath) catch unreachable;
-                std.log.info("{s}", .{line});
+                std.log.debug(".wfile: {s}", .{line});
             }
-        } else unreachable;
+        }
 
         var cmdlist = std.ArrayList([]const u8).init(gpa);
         while (raw_args.next()) |arg| {
@@ -320,12 +318,6 @@ pub fn main() !void {
 
         log.debug("FileList: {s}\n", .{filelist});
         log.debug("CmdString: {s}\n", .{cmd_string});
-
-        if (filelist.len == 0) {
-            log.err("files required", .{});
-            log.info("{s}", .{usage});
-            exit(1);
-        }
 
         if (cmd_string.len == 0) {
             log.err("cmd string required", .{});
@@ -403,25 +395,26 @@ pub fn main() !void {
             },
         }
     }
+    if (filemap.count() == 0) {
+        log.err("***no files to watch***", .{});
+        log.info("{s}", .{usage});
+        exit(1);
+    }
 
     log.info("Watching {} directories", .{filemap.count()});
+
     for (filemap.values()) |wd| {
         if (wd.watched_files.items.len == 0) {
-            log.info("> " ++ green("{s}/*"), .{wd.dirname});
+            log.info("> " ++ green("{s}"), .{wd.dirname}); // FIX: last slash
         } else {
             log.info("> " ++ green("{s}"), .{wd.dirname});
             for (wd.watched_files.items) |file| {
-                log.info(green("  ./{s}"), .{file});
+                log.info(green("    {s}"), .{file});
             }
         }
     }
     if (CONFIG.include_exts) |exts| {
         log.info("Extensions: {s}", .{exts});
-    }
-
-    if (filemap.count() == 0) {
-        log.err("***no files to watch***", .{});
-        exit(1);
     }
 
     const thread = try std.Thread.spawn(.{}, rerun_cmd, .{cmd_string});
@@ -503,7 +496,7 @@ fn listen(
 
         defer {
             should_restart_lock.lock();
-            if (should_restart) {
+            if (should_restart) { //  waht??
                 should_restart = true;
             }
             should_restart_lock.unlock();
@@ -530,7 +523,7 @@ fn listen(
 
         while (read_events_buf.len > 0) {
             {
-                // FIX: fix editors that create a backup delete, delete the original file the recreated
+                // FIX: fix editors that create a backup delete, delete the original file then recreated
                 time.sleep(time.ns_per_ms * 50);
             }
             const evt: *const std.os.linux.inotify_event =
@@ -574,14 +567,17 @@ fn listen(
 
 pub fn should_trigger_restart(filemap: *FileMap, evt: *const std.os.linux.inotify_event) bool {
     if (std.os.linux.IN.CREATE & evt.mask != 0 or
+        std.os.linux.IN.MOVE & evt.mask != 0 or
         std.os.linux.IN.MODIFY & evt.mask != 0)
     {
+        std.log.info("modified or created", .{});
         const watchdir = filemap.get(evt.wd).?;
 
         const dir_is_watching_file =
             watchdir.watched_files.items.len == 0 or
             blk: for (watchdir.watched_files.items) |item|
         {
+            std.log.info("dir is watching", .{});
             const triggered_filename = evt.getName().?;
             if (std.mem.eql(u8, item, triggered_filename)) {
                 break :blk true;
@@ -850,8 +846,9 @@ pub fn startProcess(
                 break :blk .{ first_arg, c_args };
             };
 
-            if (CONFIG.clear) {
+            if (CONFIG.clear) |delay| {
                 clearScreen();
+                time.sleep(delay);
             }
 
             _ = c.execvp(cmd_name.ptr, @ptrCast(cmd_args.items.ptr));
@@ -896,8 +893,8 @@ fn clearScreen() void {
 pub fn parse_config() void {
     var args = process.args();
     while (args.next()) |arg| {
-        if (mem.eql(u8, arg, "--clear")) {
-            CONFIG.clear = true;
+        if (mem.eql(u8, arg, "--no-clear")) {
+            CONFIG.clear = null;
         } else if (mem.eql(u8, arg, "--exts")) {
             const include_exts = args.next().?;
             std.log.debug("next: {s}", .{include_exts});

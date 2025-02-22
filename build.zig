@@ -25,19 +25,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const use_llvm = if (b.option(bool, "use-llvm", "Use LLVM")) |v| v else optimize != .Debug;
+
     const exe = b.addExecutable(.{
         .name = "wfile",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .use_llvm = use_llvm,
+        .use_lld = use_llvm,
     });
 
     exe.linkLibC();
-
-    const use_llvm = if (b.option(bool, "use-llvm", "Use LLVM")) |value|
-        value
-    else
-        optimize != .Debug;
 
     exe.use_llvm = use_llvm;
     exe.use_lld = use_llvm;
