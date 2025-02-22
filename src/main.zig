@@ -215,9 +215,9 @@ const config = struct {
     pub var clear: bool = true;
     pub var recursive: bool = true;
     pub var include_exts: ?[]const []const u8 = null;
-    pub var delay: u64 = min_delay_ms;
+    pub var delay_ms: u32 = min_delay_ms;
 };
-const min_delay_ms = 350;
+const min_delay_ms = 50;
 
 const FileMap = std.AutoArrayHashMap(
     c_int,
@@ -435,6 +435,8 @@ var should_restart = false;
 /// continuosly run cmd_string
 fn rerunProcess(args: []const []const u8) void {
     while (true) {
+        defer time.sleep(config.delay_ms * time.ns_per_ms);
+
         const restart = blk: {
             should_restart_lock.lock();
             defer should_restart_lock.unlock();
@@ -444,7 +446,6 @@ fn rerunProcess(args: []const []const u8) void {
             break :blk result;
         };
 
-        time.sleep(config.delay);
         if (restart) {
             log.debug("restart", .{});
             stopRunningProcess();
@@ -500,9 +501,11 @@ fn listen(
 
         defer {
             should_restart_lock.lock();
+
             if (should_restart) { //  waht??
                 should_restart = true;
             }
+
             should_restart_lock.unlock();
         }
 
@@ -526,10 +529,9 @@ fn listen(
         read_events_buf = read_events_buf;
 
         while (read_events_buf.len > 0) {
-            {
-                // FIX: fix editors that create a backup delete, delete the original file then recreated
-                time.sleep(time.ns_per_ms * 50);
-            }
+
+            // FIX: fix editors that create a backup delete, delete the original file then recreated
+
             const evt: *const std.os.linux.inotify_event =
                 @ptrFromInt(@intFromPtr(read_events_buf.ptr));
             defer read_events_buf = read_events_buf[event_size + evt.len ..];
@@ -913,9 +915,9 @@ fn createConfigFromArgs() void {
                 std.log.err("unabled to parse argument --delay={s} as int", .{delay_str});
                 process.exit(1);
             };
-            std.log.info("delay_ms: {}", .{delay_ms});
+            std.log.debug("delay_ms: {}", .{@max(min_delay_ms, delay_ms)});
 
-            config.delay = std.time.ns_per_ms * @max(min_delay_ms, delay_ms);
+            config.delay_ms = @max(min_delay_ms, delay_ms);
         } else if (mem.eql(u8, arg, "--no-clear")) {
             config.clear = false;
         } else if (mem.eql(u8, arg, "--exts")) {
