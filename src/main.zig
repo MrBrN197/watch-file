@@ -212,11 +212,12 @@ var tty: fs.File = undefined;
 var stdout: fs.File = undefined;
 
 const config = struct {
-    pub var clear: ?u64 = std.time.ns_per_ms * 200;
+    pub var clear: bool = true;
     pub var recursive: bool = true;
     pub var include_exts: ?[]const []const u8 = null;
-    pub var delay: u64 = std.time.ns_per_ms * 350;
+    pub var delay: u64 = min_delay_ms;
 };
+const min_delay_ms = 350;
 
 const FileMap = std.AutoArrayHashMap(
     c_int,
@@ -238,20 +239,14 @@ pub fn main() !void {
         stdout = io.getStdOut();
     }
 
-    { // sig handler
+    signal_handler: {
         var block_chld = c.sigset_t{};
         if (c.sigemptyset(&block_chld) == -1) {
-            debug.panic(
-                "sigemptyset() = {}",
-                .{errno()},
-            );
+            debug.panic("sigemptyset() = {}", .{errno()});
         }
 
         if (c.sigaddset(&block_chld, c.SIGCHLD) == -1) {
-            debug.panic(
-                "sigaddset() = {}",
-                .{errno()},
-            );
+            debug.panic("sigaddset() = {}", .{errno()});
         }
 
         var action = c.struct_sigaction{
@@ -263,11 +258,10 @@ pub fn main() !void {
         };
 
         if (c.sigaction(c.SIGCHLD, &action, null) != 0) {
-            debug.panic(
-                "[error]sigaction() = {}",
-                .{errno()},
-            );
+            debug.panic("[error]sigaction() = {}", .{errno()});
         }
+
+        break :signal_handler;
     }
 
     createConfigFromArgs();
@@ -281,6 +275,21 @@ pub fn main() !void {
         while (raw_args.next()) |arg| {
             if (mem.startsWith(u8, arg, "-c") or mem.startsWith(u8, arg, "--command"))
                 break;
+
+            {
+                const args_requiring_value = &.{
+                    "--exts",
+                    "--delay",
+                };
+                const skip_next: bool = inline for (args_requiring_value) |a| {
+                    if (std.mem.eql(u8, a, arg)) break true;
+                } else false;
+
+                if (skip_next) {
+                    _ = raw_args.next().?;
+                    continue;
+                }
+            }
 
             if (mem.eql(u8, arg, "--exts")) {
                 _ = raw_args.next().?;
@@ -435,13 +444,12 @@ fn rerunProcess(args: []const []const u8) void {
             break :blk result;
         };
 
+        time.sleep(config.delay);
         if (restart) {
             log.debug("restart", .{});
             stopRunningProcess();
             startProcess(args) catch debug.panic("unexpected error", .{});
         }
-
-        time.sleep(config.delay);
     }
 }
 
@@ -458,7 +466,8 @@ const WatchDir = struct {
 
 const num_events_max = 1;
 const event_size = @sizeOf(std.os.linux.inotify_event);
-pub fn green(comptime str: []const u8) []const u8 {
+
+fn green(comptime str: []const u8) []const u8 {
     return "\u{1b}[38;5;2m" ++ str ++ "\u{1b}[m";
 }
 
@@ -560,7 +569,7 @@ fn listen(
     }
 }
 
-pub fn shouldTriggerRestart(filemap: *FileMap, evt: *const std.os.linux.inotify_event) bool {
+fn shouldTriggerRestart(filemap: *FileMap, evt: *const std.os.linux.inotify_event) bool {
     if (std.os.linux.IN.CREATE & evt.mask != 0 or
         std.os.linux.IN.MOVE & evt.mask != 0 or
         std.os.linux.IN.MODIFY & evt.mask != 0)
@@ -597,7 +606,7 @@ pub fn shouldTriggerRestart(filemap: *FileMap, evt: *const std.os.linux.inotify_
 
 var running_pid: ?u32 = null;
 
-pub fn setForeground(
+fn setForeground(
     fd: c_int,
     pgrp: c.pid_t,
 ) void {
@@ -609,7 +618,7 @@ pub fn setForeground(
     }
 }
 
-pub fn stopRunningProcess() void {
+fn stopRunningProcess() void {
     const saved = blk: { // block
 
         var blocked = c.sigset_t{};
@@ -716,9 +725,9 @@ fn blockSignal(sig: c_int) c.sigset_t {
     return original;
 }
 
-pub fn startProcess(
-    args: []const []const u8,
-) error{UnexpectedError}!void {
+const StartProcessError = error{UnexpectedError};
+
+fn startProcess(args: []const []const u8) StartProcessError!void {
     const restore_mask = blockSignal(c.SIGUSR2);
 
     const state = fork() catch return error.UnexpectedError;
@@ -841,9 +850,8 @@ pub fn startProcess(
                 break :blk .{ first_arg, c_args };
             };
 
-            if (config.clear) |delay| {
+            if (config.clear) {
                 clearScreen();
-                time.sleep(delay);
             }
 
             _ = c.execvp(cmd_name.ptr, @ptrCast(cmd_args.items.ptr));
@@ -878,21 +886,38 @@ fn clearScreen() void {
     };
 }
 
-// ///
-// fn eraseLine() void {
-//     io.getStdOut().writeAll("\u{1b}[1K\u{0D}") catch |err|
-//         debug.panic("unable to write to standard output {s}", .{@errorName(err)});
-// }
+fn printConfig() void {
+    std.log.info("Config:", .{});
+    inline for (@typeInfo(config).@"struct".decls) |decl| {
+        const config_value = @field(config, decl.name);
+        if (@typeInfo(@TypeOf(config_value)) == .optional) {
+            if (config_value == null) {
+                std.log.info(escape_codes.dim ++ " - {s:<24} = {any}", .{ decl.name, config_value });
+            } else std.log.info(escape_codes.green ++ " - {s:<24} = {any}", .{ decl.name, config_value });
+        } else std.log.info(escape_codes.green ++ " - {s:<24} = {any}", .{ decl.name, config_value });
+    }
+}
 
-/// set CONFIG variables
-pub fn createConfigFromArgs() void {
+///
+fn createConfigFromArgs() void {
     var args = process.args();
+    defer printConfig();
+
     while (args.next()) |arg| {
         if (mem.eql(u8, arg, "--delay")) {
-            const delay_val = args.next() orelse @panic("--delay requires value");
-            config.delay = std.fmt.parseInt(u32, delay_val, 10) catch @panic("invalid argument value");
+            const delay_str = args.next() orelse {
+                log.err("--delay requires value", .{});
+                process.exit(1);
+            };
+            const delay_ms = std.fmt.parseInt(u32, delay_str, 10) catch {
+                std.log.err("unabled to parse argument --delay={s} as int", .{delay_str});
+                process.exit(1);
+            };
+            std.log.info("delay_ms: {}", .{delay_ms});
+
+            config.delay = std.time.ns_per_ms * @max(min_delay_ms, delay_ms);
         } else if (mem.eql(u8, arg, "--no-clear")) {
-            config.clear = null;
+            config.clear = false;
         } else if (mem.eql(u8, arg, "--exts")) {
             const include_exts = args.next().?;
             std.log.debug("next: {s}", .{include_exts});
@@ -908,7 +933,7 @@ pub fn createConfigFromArgs() void {
     }
 }
 
-pub fn formatEvent(event: *const std.os.linux.inotify_event) void {
+fn formatEvent(event: *const std.os.linux.inotify_event) void {
     if (event.mask == 0) return;
 
     log.debug(
@@ -937,7 +962,7 @@ pub fn formatEvent(event: *const std.os.linux.inotify_event) void {
     }
 }
 
-pub fn addDir(filemap: *FileMap, dirname: []const u8) bool {
+fn addDir(filemap: *FileMap, dirname: []const u8) bool {
     log.debug("Watching directory => {s:>20}", .{dirname});
 
     const mask = (0 |
@@ -988,7 +1013,7 @@ pub fn addDir(filemap: *FileMap, dirname: []const u8) bool {
     return true;
 }
 
-pub fn addFile(filemap: *FileMap, dirname: []const u8, filename: []const u8) bool {
+fn addFile(filemap: *FileMap, dirname: []const u8, filename: []const u8) bool {
     log.debug("Watching file => {s:>20}", .{filename});
     const mask = (0 |
         std.os.linux.IN.IGNORED | // watch was removed
@@ -1041,7 +1066,7 @@ pub fn addFile(filemap: *FileMap, dirname: []const u8, filename: []const u8) boo
     return true;
 }
 
-pub fn isExtAllowed(extensions: []const []const u8, file: []const u8) bool {
+fn isExtAllowed(extensions: []const []const u8, file: []const u8) bool {
     const ext = std.fs.path.extension(file)[1..];
 
     for (extensions) |e| {
