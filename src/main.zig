@@ -12,9 +12,6 @@ const process = std.process;
 const time = std.time;
 const assert = debug.assert;
 const eql = mem.eql;
-const exit = process.exit;
-const panic = debug.panic;
-const sleep = time.sleep;
 const event_name_slack = std.fs.max_path_bytes;
 
 const c = @import("c.zig");
@@ -94,14 +91,14 @@ fn ignoreSignal(
 ) void {
     var signal_set: c.sigset_t = undefined;
     if (c.sigemptyset(&signal_set) == -1) {
-        return panic(
+        return debug.panic(
             "sigemptyset() => errno: {}",
             .{errno()},
         );
     }
 
     if (c.sigaddset(&signal_set, signal) == -1) {
-        panic("sigaddset() => errno: {}", .{errno()});
+        debug.panic("sigaddset() => errno: {}", .{errno()});
     }
 
     const act = c.struct_sigaction{
@@ -111,18 +108,18 @@ fn ignoreSignal(
     };
 
     if (c.sigaction(signal, &act, null) == -1) {
-        panic("sigaction() => errno: {}", .{errno()});
+        debug.panic("sigaction() => errno: {}", .{errno()});
     }
 }
 
 fn defaultSignal(signal: c_int) void {
     var signal_set: c.sigset_t = undefined;
     if (c.sigemptyset(&signal_set) == -1) {
-        panic("sigemptyset() = {}", .{errno()});
+        debug.panic("sigemptyset() = {}", .{errno()});
     }
 
     if (c.sigaddset(&signal_set, signal) == -1) {
-        panic("sigaddset() = {}", .{errno()});
+        debug.panic("sigaddset() = {}", .{errno()});
     }
 
     const act = c.struct_sigaction{
@@ -132,7 +129,7 @@ fn defaultSignal(signal: c_int) void {
     };
 
     if (c.sigaction(signal, &act, null) == -1) {
-        panic("sigaction({}, {}) = {}", .{ signal, act.sa_flags, errno() });
+        debug.panic("sigaction({}, {}) = {}", .{ signal, act.sa_flags, errno() });
     }
 }
 
@@ -146,7 +143,7 @@ fn setSignal(
 ) !void {
     var signal_set: c.sigset_t = undefined;
     if (c.sigemptyset(&signal_set) == -1) {
-        return panic(
+        return debug.panic(
             "failed to set filled signal set => {}",
             .{errno()},
         );
@@ -179,18 +176,18 @@ fn sigChildHandler(
         const sigchld_pid = info.*._sifields._sigchld.si_pid;
 
         if (sigchld_pid != pid) {
-            panic("unexpected child signal pid => {}", .{sigchld_pid});
+            debug.panic("unexpected child signal pid => {}", .{sigchld_pid});
         }
 
         var wstatus: c_int = undefined;
 
         if (c.waitpid(pid, &wstatus, 0) == -1) { // FIX:
             log.err("unexpected error", .{});
-            panic(
+            debug.panic(
                 "[signal] waitpid({}) = {}",
                 .{ pid, errno() },
             );
-            exit(1);
+            process.exit(1);
         }
 
         if (c.WIFEXITED(wstatus)) {
@@ -234,7 +231,7 @@ pub fn main() !void {
 
         tty = fs.openFileAbsolute("/dev/tty", .{}) catch |err| {
             log.err("failed to open /dev/tty", .{});
-            panic("open /dev/tty = {s}", .{@errorName(err)});
+            debug.panic("open /dev/tty = {s}", .{@errorName(err)});
         };
 
         stdout = io.getStdOut();
@@ -243,14 +240,14 @@ pub fn main() !void {
     { // sig handler
         var block_chld = c.sigset_t{};
         if (c.sigemptyset(&block_chld) == -1) {
-            panic(
+            debug.panic(
                 "sigemptyset() = {}",
                 .{errno()},
             );
         }
 
         if (c.sigaddset(&block_chld, c.SIGCHLD) == -1) {
-            panic(
+            debug.panic(
                 "sigaddset() = {}",
                 .{errno()},
             );
@@ -265,7 +262,7 @@ pub fn main() !void {
         };
 
         if (c.sigaction(c.SIGCHLD, &action, null) != 0) {
-            panic(
+            debug.panic(
                 "[error]sigaction() = {}",
                 .{errno()},
             );
@@ -321,7 +318,7 @@ pub fn main() !void {
         if (cmd_string.len == 0) {
             log.err("cmd string required", .{});
             log.info("{s}", .{usage});
-            exit(1);
+            process.exit(1);
         }
 
         break :args .{ filelist, cmd_string };
@@ -331,22 +328,22 @@ pub fn main() !void {
 
     inotify_fd = std.posix.inotify_init1(notify_flags) catch |err|
         switch (err) {
-        error.ProcessFdQuotaExceeded => panic(
+        error.ProcessFdQuotaExceeded => debug.panic(
             "error: Process Quota reached --> Too many files to watch",
             .{},
         ),
         error.SystemFdQuotaExceeded => {
-            panic(
+            debug.panic(
                 "error: Process Quota reached --> Too many files to watch",
                 .{},
             );
         },
         error.SystemResources => {
             log.err("unavailable resources", .{}); // TODO:
-            exit(1);
+            process.exit(1);
         },
         else => {
-            panic("unexpected error: {s}", .{@errorName(err)});
+            debug.panic("unexpected error: {s}", .{@errorName(err)});
         },
     };
 
@@ -397,7 +394,7 @@ pub fn main() !void {
     if (filemap.count() == 0) {
         log.err("***no files to watch***", .{});
         log.info("{s}", .{usage});
-        exit(1);
+        process.exit(1);
     }
 
     log.info("Watching {} directories", .{filemap.count()});
@@ -442,10 +439,10 @@ fn rerunProcess(args: []const []const u8) void {
         if (restart) {
             log.debug("restart", .{});
             stopRunningProcess();
-            startProcess(args) catch panic("unexpected error", .{});
+            startProcess(args) catch debug.panic("unexpected error", .{});
         }
 
-        sleep(time.ns_per_ms * DELAY_MS);
+        time.sleep(time.ns_per_ms * DELAY_MS);
     }
 }
 
@@ -505,14 +502,14 @@ fn listen(
             switch (err) {
             error.WouldBlock => {
                 log.err("unexpected non-blocking on file descriptor", .{});
-                exit(1);
+                process.exit(1);
             },
             else => {
                 log.err(
                     "unexpected error reading watched event = {s}",
                     .{@errorName(err)},
                 );
-                exit(1);
+                process.exit(1);
             },
         };
         debug.assert(size < event_buffer.len);
@@ -609,7 +606,7 @@ pub fn setForeground(
     defer defaultSignal(c.SIGTTOU);
 
     if (c.tcsetpgrp(fd, pgrp) == -1) {
-        panic("tcsetpgrp({}) = {}", .{ fd, errno() });
+        debug.panic("tcsetpgrp({}) = {}", .{ fd, errno() });
     }
 }
 
@@ -618,12 +615,12 @@ pub fn stopRunningProcess() void {
 
         var blocked = c.sigset_t{};
         if (c.sigemptyset(&blocked) != 0) {
-            panic("sigemptyset", .{});
-            exit(1);
+            debug.panic("sigemptyset", .{});
+            process.exit(1);
         }
         if (c.sigaddset(&blocked, c.SIGCHLD) != 0) {
-            panic("sigaddset", .{});
-            exit(1);
+            debug.panic("sigaddset", .{});
+            process.exit(1);
         }
 
         var saved_ = c.sigset_t{};
@@ -633,7 +630,7 @@ pub fn stopRunningProcess() void {
             &saved_,
         ) != 0) {
             log.err("failed to block signal", .{});
-            panic(
+            debug.panic(
                 "sigprocmask() = {}",
                 .{errno()},
             );
@@ -649,12 +646,12 @@ pub fn stopRunningProcess() void {
             log.debug("killpg({})", .{pid});
 
             if (c.killpg(pgrp, c.SIGKILL) == -1) {
-                panic("killpg({}) = {}", .{ pgrp, errno() });
+                debug.panic("killpg({}) = {}", .{ pgrp, errno() });
             }
 
             var wstatus: c_int = undefined;
             if (c.waitpid(pgrp, &wstatus, 0) == -1) {
-                panic("waitpid({}) = {}", .{
+                debug.panic("waitpid({}) = {}", .{
                     pgrp,
                     errno(),
                 });
@@ -666,12 +663,12 @@ pub fn stopRunningProcess() void {
             if (c.WIFSIGNALED(wstatus)) {
                 // if (cc.WTERMSIG(wstatus) != cc.SIGKILL) {
                 //     log.err("[error]unexpectedly killed by signal = {}", .{cc.WTERMSIG(wstatus)});
-                //     panic("[error]unexpectedly killed by signal = {}", .{cc.WTERMSIG(wstatus)});
+                //     debug.panic("[error]unexpectedly killed by signal = {}", .{cc.WTERMSIG(wstatus)});
                 // }
             } else if (c.WIFSTOPPED(wstatus)) {
-                panic("unexpected caught signal; process stopped {}", .{pgrp});
+                debug.panic("unexpected caught signal; process stopped {}", .{pgrp});
             } else if (c.WIFCONTINUED(wstatus)) {
-                panic("unexpected caught signal; process continued {}", .{pgrp});
+                debug.panic("unexpected caught signal; process continued {}", .{pgrp});
             }
         }
     }
@@ -681,7 +678,7 @@ pub fn stopRunningProcess() void {
         if (c.sigprocmask(c.SIG_SETMASK, &saved, null) !=
             0)
         {
-            panic(
+            debug.panic(
                 "sigprocmask() = {}",
                 .{errno()},
             );
@@ -698,7 +695,7 @@ fn blockSignal(sig: c_int) c.sigset_t {
             "sigemptyset() = {}",
             .{errno()},
         );
-        exit(1);
+        process.exit(1);
     }
 
     if (c.sigaddset(&mask, sig) != 0) {
@@ -706,7 +703,7 @@ fn blockSignal(sig: c_int) c.sigset_t {
             "sigaddset() = {}",
             .{errno()},
         );
-        exit(1);
+        process.exit(1);
     }
 
     if (c.sigprocmask(c.SIG_BLOCK, &mask, &original) != 0) {
@@ -714,7 +711,7 @@ fn blockSignal(sig: c_int) c.sigset_t {
             "sigprocmask() = {}",
             .{errno()},
         );
-        exit(1);
+        process.exit(1);
     }
 
     return original;
@@ -734,7 +731,7 @@ pub fn startProcess(
             { //
                 if (c.setpgid(pid, pid) == -1) {
                     log.err("parent failed to create process group", .{});
-                    panic(
+                    debug.panic(
                         "setpgid({},{}) => ",
                         .{ pid, errno() },
                     );
@@ -776,10 +773,10 @@ pub fn startProcess(
 
                 var mask = c.sigset_t{};
                 if (c.sigfillset(&mask) != 0) {
-                    panic("sigfillset = {}", .{errno()});
+                    debug.panic("sigfillset = {}", .{errno()});
                 }
                 if (c.sigdelset(&mask, c.SIGUSR2) != 0) {
-                    panic("sigdelset = {}", .{errno()});
+                    debug.panic("sigdelset = {}", .{errno()});
                 }
 
                 _ = c.sigsuspend(&mask);
@@ -858,12 +855,12 @@ pub fn startProcess(
                     "skipping '{s}', file does not exist.",
                     .{cmd_name},
                 ),
-                else => panic(
+                else => debug.panic(
                     "failed to run executable = {}",
                     .{e},
                 ),
             }
-            exit(1);
+            process.exit(1);
         },
     }
 
@@ -876,7 +873,7 @@ pub fn startProcess(
 ///
 fn clearScreen() void {
     io.getStdOut().writeAll("\u{1b}[2J\u{1b}[H") catch |err| {
-        panic("unable to write to standard output {s}", .{
+        debug.panic("unable to write to standard output {s}", .{
             @errorName(err),
         });
     };
@@ -885,7 +882,7 @@ fn clearScreen() void {
 // ///
 // fn eraseLine() void {
 //     io.getStdOut().writeAll("\u{1b}[1K\u{0D}") catch |err|
-//         panic("unable to write to standard output {s}", .{@errorName(err)});
+//         debug.panic("unable to write to standard output {s}", .{@errorName(err)});
 // }
 
 /// set CONFIG variables
